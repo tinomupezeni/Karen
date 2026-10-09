@@ -1,0 +1,40 @@
+[package]
+name = "app"
+version = "0.1.0"
+description = "A Tauri App"
+authors = ["you"]
+license = ""
+repository = ""
+edition = "2024"
+rust-version = "1.90"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+name = "app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.7.1", features = [] }
+
+[dependencies]
+serde_json = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+log = "0.4"
+tauri = { version = "2.12.1", features = [] }
+tauri-plugin-log = "2"
+cpal = "0.18.2"
+tokio = { version = "1.53.2", features = ["full"] }
+whisper-rs = { version = "0.16.0", features = ["log_backend"] }
+reqwest = { version = "0.13.5", features = ["json"] }
+chrono = "0.4.45"
+which = "8.0.6"
+dotenvy = "0.15.7"
+dirs = "7.0.0"
+sysinfo = "0.38.4"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+uuid = { version = "1.27.0", features = ["v4"] }
+async-trait = "0.1.92"
+
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+tauri-plugin-global-shortcut = "2"

@@ -1,0 +1,14 @@
+:root {
+  background-color: transparent !important;
+}
+
+body {
+  margin: 0;
+  display: flex;
+  place-items: center;
+  min-width: 320px;
+  min-height: 100vh;
+  background-color: transparent !important;
+  overflow: hidden;
+  user-select: none;
+}
