@@ -4,18 +4,18 @@ use super::piper::PiperProvider;
 use std::path::PathBuf;
 
 pub struct TtsManager {
-    primary: Box<dyn TtsProvider>,
-    fallback: Box<dyn TtsProvider>,
+    groq: Box<dyn TtsProvider>,
+    piper: Box<dyn TtsProvider>,
     max_retries: usize,
 }
 
 impl TtsManager {
     pub fn new() -> Result<Self, String> {
-        let primary = GroqProvider::new()?;
-        let fallback = PiperProvider::new()?;
+        let groq = GroqProvider::new()?;
+        let piper = PiperProvider::new()?;
         Ok(Self {
-            primary: Box::new(primary),
-            fallback: Box::new(fallback),
+            groq: Box::new(groq),
+            piper: Box::new(piper),
             max_retries: 2,
         })
     }
@@ -23,17 +23,30 @@ impl TtsManager {
     #[cfg(test)]
     pub fn with_providers(primary: Box<dyn TtsProvider>, fallback: Box<dyn TtsProvider>) -> Self {
         Self {
-            primary,
-            fallback,
+            groq: primary,
+            piper: fallback,
             max_retries: 2,
         }
     }
 
     pub async fn generate_audio(&self, text: &str) -> Result<(PathBuf, &'static str), TtsError> {
+        // Keep speech local by default. Set KAREN_TTS_PROVIDER=groq when the
+        // Hannah cloud voice is specifically wanted.
+        let prefer_piper = std::env::var("KAREN_TTS_PROVIDER")
+            .map(|value| value.eq_ignore_ascii_case("piper"))
+            .unwrap_or(!cfg!(test))
+            || std::env::var("KAREN_VOICE_PROFILE")
+                .map(|value| value.eq_ignore_ascii_case("fast"))
+                .unwrap_or(false);
+        let (primary, fallback): (&dyn TtsProvider, &dyn TtsProvider) = if prefer_piper {
+            (&*self.piper, &*self.groq)
+        } else {
+            (&*self.groq, &*self.piper)
+        };
         let mut attempts = 0;
         loop {
-            match self.primary.generate_audio(text).await {
-                Ok(path) => return Ok((path, self.primary.name())),
+            match primary.generate_audio(text).await {
+                Ok(path) => return Ok((path, primary.name())),
                 Err(e) => {
                     attempts += 1;
                     match e {
@@ -43,8 +56,14 @@ impl TtsManager {
                         }
                         TtsError::Retryable(msg) => {
                             log::warn!("[TTS] Primary provider retryable error (attempt {}): {}", attempts, msg);
+                            // A rate limit will not clear during a short retry backoff. Fall back
+                            // immediately so a cloud quota issue cannot make Karen feel silent.
+                            if msg.contains("429") || msg.to_ascii_lowercase().contains("rate limit") {
+                                log::warn!("[TTS] Primary provider is rate limited. Falling back to {} immediately.", fallback.name());
+                                break;
+                            }
                             if attempts >= self.max_retries {
-                                log::warn!("[TTS] Max retries reached for primary. Falling back to {}.", self.fallback.name());
+                                log::warn!("[TTS] Max retries reached for primary. Falling back to {}.", fallback.name());
                                 break;
                             }
                             // Brief backoff
@@ -56,8 +75,8 @@ impl TtsManager {
         }
 
         // Fallback
-        match self.fallback.generate_audio(text).await {
-            Ok(path) => Ok((path, self.fallback.name())),
+        match fallback.generate_audio(text).await {
+            Ok(path) => Ok((path, fallback.name())),
             Err(e) => {
                 log::error!("[TTS] Fallback provider also failed: {}", e);
                 Err(e)

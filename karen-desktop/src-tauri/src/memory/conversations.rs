@@ -69,7 +69,7 @@ impl Database {
             "SELECT id, conversation_id, role, content, recorded_at 
              FROM messages 
              WHERE conversation_id = ?1 
-             ORDER BY recorded_at ASC 
+             ORDER BY recorded_at DESC
              LIMIT ?2"
         )?;
         
@@ -87,6 +87,7 @@ impl Database {
         for msg in msg_iter {
             messages.push(msg?);
         }
+        messages.reverse();
         Ok(messages)
     }
 }

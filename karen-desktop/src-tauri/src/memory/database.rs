@@ -37,11 +37,13 @@ impl Database {
                 id TEXT PRIMARY KEY,
                 content TEXT NOT NULL,
                 source_id TEXT,
+                embedding TEXT,
                 recorded_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                 updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )",
             [],
         )?;
+        let _ = conn.execute("ALTER TABLE memories ADD COLUMN embedding TEXT", []);
 
         // Check if fts is already created
         conn.execute(

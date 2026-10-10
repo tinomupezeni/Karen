@@ -1,10 +1,141 @@
 use serde_json::{json, Value};
+use tauri::Emitter;
 
 use super::devlogs;
 use super::open_app;
+use std::sync::{Mutex, OnceLock};
+
+static PENDING_TOOL: OnceLock<Mutex<Option<(String, String)>>> = OnceLock::new();
+
+fn pending_tool() -> &'static Mutex<Option<(String, String)>> {
+    PENDING_TOOL.get_or_init(|| Mutex::new(None))
+}
+
+fn valid_url(url: &str) -> bool {
+    let valid_scheme = url.starts_with("https://") || url.starts_with("http://");
+    let unsafe_char = url.chars().any(|c| matches!(c, '\n' | '\r' | ';' | '&' | '|' | '`' | '$'));
+    valid_scheme && !unsafe_char && url.len() <= 2048
+}
+
+fn open_url(args: Value) -> Value {
+    let Some(url) = args.get("url").and_then(Value::as_str).map(str::trim) else {
+        return json!({ "ok": false, "error": "missing 'url' argument" });
+    };
+
+    if !valid_url(url) {
+        return json!({ "ok": false, "error": "only safe http(s) URLs are allowed" });
+    }
+
+    match std::process::Command::new("xdg-open").arg(url).spawn() {
+        Ok(_) => json!({ "ok": true, "opened": url }),
+        Err(e) => json!({ "ok": false, "error": format!("failed to open URL: {e}") }),
+    }
+}
+
+fn get_system_info() -> Value {
+    let os = std::process::Command::new("uname")
+        .arg("-a")
+        .output()
+        .ok()
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .unwrap_or_else(|| "unknown".into());
+    json!({ "ok": true, "platform": os, "hostname": std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown".into()) })
+}
+
+fn valid_volume(value: i64) -> bool { (0..=100).contains(&value) }
+
+fn set_volume(args: Value) -> Value {
+    let Some(value) = args.get("percent").and_then(Value::as_i64) else {
+        return json!({ "ok": false, "error": "missing 'percent' argument" });
+    };
+    if !valid_volume(value) {
+        return json!({ "ok": false, "error": "volume must be between 0 and 100" });
+    }
+    match std::process::Command::new("pactl")
+        .args(["set-sink-volume", "@DEFAULT_SINK@", &format!("{value}%")])
+        .status()
+    {
+        Ok(status) if status.success() => json!({ "ok": true, "percent": value }),
+        Ok(status) => json!({ "ok": false, "error": format!("pactl exited with {status}") }),
+        Err(e) => json!({ "ok": false, "error": format!("failed to set volume: {e}") }),
+    }
+}
+
+fn screenshot() -> Value {
+    let path = format!("/tmp/karen-screenshot-{}.png", chrono::Utc::now().timestamp_millis());
+    let result = std::process::Command::new("gnome-screenshot").args(["-f", &path]).status();
+    match result {
+        Ok(status) if status.success() => json!({ "ok": true, "path": path }),
+        Ok(status) => json!({ "ok": false, "error": format!("screenshot command exited with {status}") }),
+        Err(e) => json!({ "ok": false, "error": format!("screenshot unavailable: {e}") }),
+    }
+}
+
+fn valid_key(key: &str) -> bool {
+    matches!(key, "Return" | "Escape" | "Tab" | "space" | "Up" | "Down" | "Left" | "Right" | "ctrl+c" | "ctrl+v" | "ctrl+x" | "ctrl+s")
+}
+
+fn press_key(args: Value) -> Value {
+    let Some(key) = args.get("key").and_then(Value::as_str) else {
+        return json!({ "ok": false, "error": "missing 'key' argument" });
+    };
+    if !valid_key(key) {
+        return json!({ "ok": false, "error": "key is not in Karen's safe key allowlist" });
+    }
+    match std::process::Command::new("xdotool").args(["key", key]).status() {
+        Ok(status) if status.success() => json!({ "ok": true, "key": key }),
+        Ok(status) => json!({ "ok": false, "error": format!("xdotool exited with {status}") }),
+        Err(e) => json!({ "ok": false, "error": format!("keyboard control unavailable: {e}") }),
+    }
+}
+
+fn type_text(args: Value) -> Value {
+    let Some(text) = args.get("text").and_then(Value::as_str) else {
+        return json!({ "ok": false, "error": "missing 'text' argument" });
+    };
+    if text.is_empty() || text.len() > 4000 || text.chars().any(|c| c == '\n' || c == '\r') {
+        return json!({ "ok": false, "error": "text must be 1-4000 characters without newlines" });
+    }
+    match std::process::Command::new("xdotool").args(["type", "--", text]).status() {
+        Ok(status) if status.success() => json!({ "ok": true, "characters": text.chars().count() }),
+        Ok(status) => json!({ "ok": false, "error": format!("xdotool exited with {status}") }),
+        Err(e) => json!({ "ok": false, "error": format!("keyboard control unavailable: {e}") }),
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToolRisk {
+    AutoRun,
+    ConfirmRequired,
+}
+
+impl ToolRisk {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::AutoRun => "auto_run",
+            Self::ConfirmRequired => "confirm_required",
+        }
+    }
+}
+
+pub fn risk_for(name: &str) -> ToolRisk {
+    match name {
+        // These tools only inspect local state or update Karen's own memory.
+        "list_directory" | "read_file" | "list_dev_logs" | "read_dev_logs"
+        | "get_current_time" | "search_events" | "save_memory" => ToolRisk::AutoRun,
+        // Launching an application changes desktop state and will become
+        // confirmation-aware when the UI confirmation flow is added.
+        "open_app" => ToolRisk::ConfirmRequired,
+        "open_url" => ToolRisk::AutoRun,
+        "get_system_info" | "take_screenshot" | "screen_ocr" => ToolRisk::AutoRun,
+        "list_processes" => ToolRisk::AutoRun,
+        "set_volume" | "type_text" | "press_key" => ToolRisk::ConfirmRequired,
+        _ => ToolRisk::ConfirmRequired,
+    }
+}
 
 pub fn all_tool_defs() -> Vec<Value> {
-    vec![
+    let mut definitions = vec![
         json!({
             "type": "function",
             "function": {
@@ -20,6 +151,76 @@ pub fn all_tool_defs() -> Vec<Value> {
                     },
                     "required": ["name"]
                 }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "open_url",
+                "description": "Open a safe HTTP or HTTPS URL in the default browser.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "url": { "type": "string", "description": "An http:// or https:// URL." }
+                    },
+                    "required": ["url"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "get_system_info",
+                "description": "Report basic operating system and hostname information.",
+                "parameters": { "type": "object", "properties": {} }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "take_screenshot",
+                "description": "Capture the current desktop to a temporary PNG file.",
+                "parameters": { "type": "object", "properties": {} }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "screen_ocr",
+                "description": "Capture the current desktop and extract visible English text with OCR.",
+                "parameters": { "type": "object", "properties": {} }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "list_processes",
+                "description": "List the top currently running processes sorted by CPU usage.",
+                "parameters": { "type": "object", "properties": {} }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "set_volume",
+                "description": "Set the system output volume from 0 to 100 percent.",
+                "parameters": { "type": "object", "properties": { "percent": { "type": "integer" } }, "required": ["percent"] }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "type_text",
+                "description": "Type text into the currently focused application.",
+                "parameters": { "type": "object", "properties": { "text": { "type": "string" } }, "required": ["text"] }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "press_key",
+                "description": "Press one key or safe keyboard shortcut.",
+                "parameters": { "type": "object", "properties": { "key": { "type": "string" } }, "required": ["key"] }
             }
         }),
         json!({
@@ -137,12 +338,53 @@ pub fn all_tool_defs() -> Vec<Value> {
                 }
             }
         }),
-    ]
+    ];
+
+    // Keep risk metadata beside the canonical tool definitions so the model,
+    // UI, and executor can share one registry as the action surface grows.
+    for definition in &mut definitions {
+        if let Some(function) = definition.get_mut("function") {
+            if let Some(name) = function.get("name").and_then(Value::as_str) {
+                function["x-risk"] = json!(risk_for(name).as_str());
+            }
+        }
+    }
+
+    definitions
 }
 
 use super::browse_files;
+mod system;
+mod memory;
 
 pub async fn dispatch(name: &str, args_json: &str, app: &tauri::AppHandle) -> Value {
+    dispatch_inner(name, args_json, app, false).await
+}
+
+async fn dispatch_inner(name: &str, args_json: &str, app: &tauri::AppHandle, confirmed: bool) -> Value {
+    if risk_for(name) == ToolRisk::ConfirmRequired && !confirmed {
+        if let Ok(mut pending) = pending_tool().lock() {
+            *pending = Some((name.to_string(), args_json.to_string()));
+        }
+        {
+            use tauri::Manager;
+            let memory = app.state::<crate::memory::MemoryEngine>();
+            let db = memory.db.lock().await;
+            let description = format!("Tool: {name} | Status: confirmation_required | Args: {args_json}");
+            let _ = db.record_event("tool_confirmation_requested", &description, Some("brain::tools"));
+        }
+        let _ = app.emit("karen-pipeline", json!({
+            "stage": "confirmation-required",
+            "detail": format!("Approve action: {name}")
+        }));
+        return json!({
+            "ok": false,
+            "confirmation_required": true,
+            "tool": name,
+            "message": format!("Confirmation required before running {name}.")
+        });
+    }
+
     let parsed: Value = match serde_json::from_str(args_json) {
         Ok(v) => v,
         Err(e) => return json!({ "ok": false, "error": format!("bad tool arguments: {e}") }),
@@ -152,23 +394,19 @@ pub async fn dispatch(name: &str, args_json: &str, app: &tauri::AppHandle) -> Va
 
     let result = match name {
         "open_app" => open_app::run(parsed.clone()).await,
+        "open_url" => system::open_url(parsed.clone()),
+        "get_system_info" => system::get_system_info(),
+        "list_processes" => system::list_processes(),
+        "take_screenshot" => system::screenshot(),
+        "screen_ocr" => system::screen_ocr(),
+        "set_volume" => system::set_volume(parsed.clone()),
+        "type_text" => system::type_text(parsed.clone()),
+        "press_key" => system::press_key(parsed.clone()),
         "list_dev_logs" => devlogs::list(parsed.clone()).await,
         "read_dev_logs" => devlogs::read(parsed.clone()).await,
         "list_directory" => browse_files::list_directory(parsed.clone()).await,
         "read_file" => browse_files::read_file(parsed.clone()).await,
-        "save_memory" => {
-            if let Some(content) = parsed.get("content").and_then(|v| v.as_str()) {
-                use tauri::Manager;
-                let memory = app.state::<crate::memory::MemoryEngine>();
-                let db = memory.db.lock().await;
-                match db.save_memory(content, None) {
-                    Ok(id) => json!({ "ok": true, "id": id }),
-                    Err(e) => json!({ "ok": false, "error": e.to_string() }),
-                }
-            } else {
-                json!({ "ok": false, "error": "missing content parameter" })
-            }
-        },
+        "save_memory" => memory::save_memory(parsed.clone(), app).await,
         "get_current_time" => {
             let utc = chrono::Utc::now();
             let local = chrono::Local::now();
@@ -179,16 +417,7 @@ pub async fn dispatch(name: &str, args_json: &str, app: &tauri::AppHandle) -> Va
                 "timezone": local.offset().to_string()
             })
         },
-        "search_events" => {
-            let limit = parsed.get("limit").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
-            use tauri::Manager;
-            let memory = app.state::<crate::memory::MemoryEngine>();
-            let db = memory.db.lock().await;
-            match db.get_recent_events(limit) {
-                Ok(events) => json!({ "ok": true, "events": events }),
-                Err(e) => json!({ "ok": false, "error": e.to_string() }),
-            }
-        },
+        "search_events" => memory::search_events(parsed.clone(), app).await,
         other => json!({ "ok": false, "error": format!("unknown tool: {other}") }),
     };
 
@@ -213,4 +442,65 @@ pub async fn dispatch(name: &str, args_json: &str, app: &tauri::AppHandle) -> Va
     }
 
     result
+}
+
+pub async fn confirm_pending(app: &tauri::AppHandle) -> Value {
+    let pending = pending_tool().lock().ok().and_then(|mut value| value.take());
+    match pending {
+        Some((name, args)) => dispatch_inner(&name, &args, app, true).await,
+        None => json!({ "ok": false, "error": "no pending action to confirm" }),
+    }
+}
+
+pub fn cancel_pending() -> Value {
+    let had_pending = pending_tool().lock().ok().and_then(|mut value| value.take()).is_some();
+    if had_pending {
+        json!({ "ok": true, "cancelled": true })
+    } else {
+        json!({ "ok": false, "error": "no pending action to cancel" })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{all_tool_defs, risk_for, valid_key, valid_volume, ToolRisk};
+    use std::collections::HashSet;
+
+    #[test]
+    fn registry_has_unique_names_and_risk_metadata() {
+        let definitions = all_tool_defs();
+        let names: HashSet<&str> = definitions
+            .iter()
+            .filter_map(|definition| definition["function"]["name"].as_str())
+            .collect();
+
+        assert_eq!(names.len(), definitions.len());
+        for definition in definitions {
+            let function = &definition["function"];
+            assert!(function["x-risk"].is_string());
+        }
+    }
+
+    #[test]
+    fn desktop_mutation_is_marked_for_confirmation() {
+        assert_eq!(risk_for("open_app"), ToolRisk::ConfirmRequired);
+        assert_eq!(risk_for("read_file"), ToolRisk::AutoRun);
+        assert_eq!(risk_for("unknown"), ToolRisk::ConfirmRequired);
+    }
+
+    #[test]
+    fn rejects_unsafe_urls() {
+        assert!(super::valid_url("https://example.com"));
+        assert!(!super::valid_url("file:///etc/passwd"));
+        assert!(!super::valid_url("https://example.com;whoami"));
+    }
+
+    #[test]
+    fn validates_desktop_action_arguments() {
+        assert!(valid_volume(0));
+        assert!(valid_volume(100));
+        assert!(!valid_volume(101));
+        assert!(valid_key("ctrl+s"));
+        assert!(!valid_key("rm -rf /"));
+    }
 }

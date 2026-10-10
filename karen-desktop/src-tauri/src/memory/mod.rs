@@ -1,6 +1,7 @@
 pub mod database;
 pub mod conversations;
 pub mod temporal;
+pub mod semantic;
 pub mod memories;
 pub mod events;
 

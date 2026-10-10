@@ -1,19 +1,88 @@
 mod devlogs;
 mod open_app;
 mod browse_files;
-mod tools;
+pub mod tools;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter, Manager};
+use std::sync::OnceLock;
 
 const GROQ_CHAT_URL: &str = "https://api.groq.com/openai/v1/chat/completions";
+const DEFAULT_OLLAMA_URL: &str = "http://10.50.101.11:11434/v1/chat/completions";
 const DEFAULT_MODEL: &str = "openai/gpt-oss-120b";
+const DEFAULT_CONTEXT_MESSAGES: usize = 10;
+const MAX_CONTEXT_MESSAGE_CHARS: usize = 4000;
+const MAX_TTS_CHUNK_CHARS: usize = 160;
+
+fn context_message_limit() -> usize {
+    std::env::var("KAREN_CONTEXT_MESSAGES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| (2..=40).contains(value))
+        .unwrap_or(DEFAULT_CONTEXT_MESSAGES)
+}
+
+fn compact_context_message(content: &str) -> String {
+    if content.chars().count() <= MAX_CONTEXT_MESSAGE_CHARS {
+        return content.to_string();
+    }
+    let prefix: String = content.chars().take(MAX_CONTEXT_MESSAGE_CHARS).collect();
+    format!("{prefix}… [earlier detail compacted]")
+}
+
+fn needs_semantic_memory(transcript: &str) -> bool {
+    let text = transcript.to_ascii_lowercase();
+    [
+        "remember", "memory", "memories", "recall", "forgot", "preference",
+        "yesterday", "last time", "previous", "we worked", "we discussed",
+        "what did we", "my project", "my setup",
+    ].iter().any(|phrase| text.contains(phrase))
+}
+
+fn next_tts_boundary(text: &str, start: usize) -> Option<usize> {
+    if let Some(offset) = text[start..].find(|c| c == '.' || c == '!' || c == '?') {
+        return Some(start + offset + 1);
+    }
+    if text[start..].chars().count() >= MAX_TTS_CHUNK_CHARS {
+        let boundary = text[start..]
+            .char_indices()
+            .take(MAX_TTS_CHUNK_CHARS)
+            .filter(|(_, c)| c.is_whitespace() || *c == ',' || *c == ';' || *c == ':')
+            .map(|(idx, _)| start + idx)
+            .last();
+        return boundary.map(|idx| idx + 1);
+    }
+    None
+}
 const MAX_ITERS: usize = 5;
 
 const PERSONA_PATH_ENV: &str = "KAREN_PERSONA_PATH";
 const DEFAULT_PERSONA_PATH: &str = "/home/shadowe/Projects/Karen/Persona.md";
 const FALLBACK_PERSONA: &str = "You are Karen, a voice-activated desktop assistant.";
+static HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+
+fn http_client() -> Result<&'static reqwest::Client, String> {
+    if let Some(client) = HTTP_CLIENT.get() {
+        return Ok(client);
+    }
+    let client = reqwest::Client::builder()
+        .pool_idle_timeout(std::time::Duration::from_secs(90))
+        .tcp_keepalive(std::time::Duration::from_secs(30))
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| format!("failed to build HTTP client: {e}"))?;
+    let _ = HTTP_CLIENT.set(client);
+    Ok(HTTP_CLIENT.get().expect("HTTP client was just initialized"))
+    /*
+        reqwest::Client::builder()
+            .pool_idle_timeout(std::time::Duration::from_secs(90))
+            .tcp_keepalive(std::time::Duration::from_secs(30))
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .map_err(|e| format!("failed to build HTTP client: {e}"))
+    */
+}
 
 /// Reads fresh each call rather than cached, so editing Persona.md takes
 /// effect on the next spoken command without an app restart. It's a small
@@ -162,20 +231,43 @@ fn emit_running_tool(app: &AppHandle, name: &str, gen_id: usize) {
 }
 
 pub async fn run_agentic(transcript: &str, app: &AppHandle, speech_ended_at: Option<std::time::Instant>, current_gen_id: usize) -> Result<String, String> {
-    let api_key = std::env::var("GROQ_API_KEY")
-        .map_err(|_| "GROQ_API_KEY is not set".to_string())?;
-    let model = std::env::var("GROQ_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_string());
+    let provider = std::env::var("KAREN_LLM_PROVIDER").unwrap_or_else(|_| "groq".into());
+    let use_ollama = provider.eq_ignore_ascii_case("ollama");
+    let api_key = if use_ollama { None } else { Some(std::env::var("GROQ_API_KEY").map_err(|_| "GROQ_API_KEY is not set".to_string())?) };
+    let model = if use_ollama {
+        std::env::var("KAREN_OLLAMA_MODEL").unwrap_or_else(|_| "qwen2.5:3b".into())
+    } else {
+        std::env::var("GROQ_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_string())
+    };
+    let endpoint = if use_ollama {
+        std::env::var("KAREN_OLLAMA_URL").unwrap_or_else(|_| DEFAULT_OLLAMA_URL.into())
+    } else {
+        GROQ_CHAT_URL.into()
+    };
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
     let persona = load_persona().await;
+    let proactive_mode = std::env::var("KAREN_PROACTIVE_MODE")
+        .map(|value| matches!(value.to_ascii_lowercase().as_str(), "true" | "1" | "on"))
+        .unwrap_or(false);
 
     let context_engine = app.state::<crate::context_engine::ContextEngine>();
     let ctx = context_engine.get_context();
+    let query_embedding = if use_ollama && needs_semantic_memory(transcript) {
+        crate::memory::semantic::ollama_embedding(transcript).await.ok()
+    } else {
+        None
+    };
     let (relevant_memories, recent_events) = {
         let memory = app.state::<crate::memory::MemoryEngine>();
         let db = memory.db.lock().await;
 
         let mut relevant_memories = String::new();
-        if let Ok(memories) = db.search_memories(transcript) {
+        let memories = if let Some(ref embedding) = query_embedding {
+            db.search_semantic_memories(embedding, 5).or_else(|_| db.search_memories(transcript))
+        } else {
+            db.search_memories(transcript)
+        };
+        if let Ok(memories) = memories {
             if !memories.is_empty() {
                 relevant_memories.push_str("\n\nRelevant past memories:\n");
                 for m in memories {
@@ -211,7 +303,9 @@ pub async fn run_agentic(transcript: &str, app: &AppHandle, speech_ended_at: Opt
              the request calls for it. Only answer directly with plain text once you have \
              everything you need. Despite the persona above, keep answers concise -- they may \
              be read aloud via text-to-speech or shown in a small status pill; save depth for \
-             when elaboration is specifically asked for."
+             when elaboration is specifically asked for. Proactive mode is {proactive_mode}; \
+             when it is enabled, offer one relevant next step or useful observation after \
+             completing the request, but never invent activity or interrupt without a clear reason."
         )),
     ];
 
@@ -224,14 +318,14 @@ pub async fn run_agentic(transcript: &str, app: &AppHandle, speech_ended_at: Opt
             None => db.create_conversation().unwrap_or_else(|_| "default-conv".to_string()),
         };
 
-        if let Ok(recent) = db.get_recent_messages(&id, 10) {
+        if let Ok(recent) = db.get_recent_messages(&id, context_message_limit()) {
             for msg in recent {
                 let time_str = crate::memory::temporal::format_relative_time(&msg.recorded_at);
                 if msg.role == "user" {
-                    let content_with_time = format!("[{time_str}]: {}", msg.content);
+                    let content_with_time = format!("[{time_str}]: {}", compact_context_message(&msg.content));
                     messages.push(Message::user(content_with_time));
                 } else if msg.role == "assistant" {
-                    messages.push(Message::assistant(msg.content));
+                    messages.push(Message::assistant(compact_context_message(&msg.content)));
                 }
             }
         }
@@ -243,10 +337,7 @@ pub async fn run_agentic(transcript: &str, app: &AppHandle, speech_ended_at: Opt
     messages.push(Message::user(transcript.to_string()));
 
     let tools = tools::all_tool_defs();
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .map_err(|e| format!("failed to build HTTP client: {e}"))?;
+    let client = http_client()?;
 
     for _ in 0..MAX_ITERS {
         let request = ChatRequest {
@@ -261,21 +352,21 @@ pub async fn run_agentic(transcript: &str, app: &AppHandle, speech_ended_at: Opt
         };
 
         let body = serde_json::to_vec(&request).map_err(|e| format!("failed to encode request: {e}"))?;
-        log::debug!("Groq request body: {} bytes", body.len());
+        log::debug!("{} request body: {} bytes", if use_ollama { "Ollama" } else { "Groq" }, body.len());
 
-        let mut response = client
-            .post(GROQ_CHAT_URL)
-            .bearer_auth(&api_key)
+        let mut request = client
+            .post(&endpoint)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .body(body)
-            .send()
-            .await
-            .map_err(|e| format!("Groq request failed: {e}"))?;
+            .body(body);
+        if let Some(key) = &api_key {
+            request = request.bearer_auth(key);
+        }
+        let mut response = request.send().await.map_err(|e| format!("LLM request failed: {e}"))?;
 
         let status = response.status();
         if !status.is_success() {
             let text = response.text().await.unwrap_or_default();
-            return Err(format!("Groq returned {status}: {text}"));
+            return Err(format!("LLM provider returned {status}: {text}"));
         }
 
         let mut accumulated_content = String::new();
@@ -284,6 +375,7 @@ pub async fn run_agentic(transcript: &str, app: &AppHandle, speech_ended_at: Opt
         let mut first_token = true;
         let mut last_spoken_idx = 0;
         let mut seq_num = 0;
+        let mut acknowledgement_spoken = false;
         let utterance_id = format!("u-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis());
 
         while let Some(chunk) = response.chunk().await.map_err(|e| format!("stream error: {e}"))? {
@@ -320,8 +412,7 @@ pub async fn run_agentic(transcript: &str, app: &AppHandle, speech_ended_at: Opt
                                         let _ = app.emit("karen-pipeline", json!({ "stage": "answer", "detail": accumulated_content }));
                                     }
                                     
-                                    while let Some(idx) = accumulated_content[last_spoken_idx..].find(|c| c == '.' || c == '!' || c == '?') {
-                                        let end_idx = last_spoken_idx + idx + 1;
+                                    while let Some(end_idx) = next_tts_boundary(&accumulated_content, last_spoken_idx) {
                                         let sentence = accumulated_content[last_spoken_idx..end_idx].trim().to_string();
                                         
                                         if sentence.chars().any(|c| c.is_alphanumeric()) {
@@ -386,10 +477,51 @@ pub async fn run_agentic(transcript: &str, app: &AppHandle, speech_ended_at: Opt
 
         for call in tool_calls {
             emit_running_tool(app, &call.function.name, current_gen_id);
+            if !acknowledgement_spoken && accumulated_content.trim().is_empty() {
+                crate::tts::speak_chunk(
+                    tool_acknowledgement(&call.function.name).to_string(),
+                    speech_ended_at,
+                    utterance_id.clone(),
+                    seq_num,
+                    current_gen_id,
+                );
+                seq_num += 1;
+                acknowledgement_spoken = true;
+            }
             let result = tools::dispatch(&call.function.name, &call.function.arguments, app).await;
             messages.push(Message::tool_result(call.id, call.function.name.clone(), result));
         }
     }
 
     Err("gave up after several tool-calling iterations without a final answer".to_string())
+}
+
+fn tool_acknowledgement(name: &str) -> &'static str {
+    match name {
+        "open_app" | "open_url" => "Opening that now.",
+        "read_file" | "list_directory" | "list_dev_logs" | "read_dev_logs" => "I’m checking that now.",
+        "screen_ocr" | "take_screenshot" => "I’m looking at the screen now.",
+        "list_processes" | "get_system_info" => "I’m checking the system now.",
+        "save_memory" => "I’ll remember that.",
+        _ => "Working on that now.",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{needs_semantic_memory, tool_acknowledgement};
+
+    #[test]
+    fn semantic_lookup_is_reserved_for_memory_questions() {
+        assert!(needs_semantic_memory("What did we work on yesterday?"));
+        assert!(needs_semantic_memory("remember that my VM is on the lab network"));
+        assert!(!needs_semantic_memory("open the browser"));
+        assert!(!needs_semantic_memory("set the volume to 40"));
+    }
+
+    #[test]
+    fn tool_acknowledgements_are_short() {
+        assert_eq!(tool_acknowledgement("open_app"), "Opening that now.");
+        assert!(tool_acknowledgement("unknown").chars().count() < 40);
+    }
 }

@@ -14,13 +14,29 @@ fn model_filename() -> String {
     std::env::var("KAREN_WHISPER_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_string())
 }
 
+fn validate_model_override(value: &str) -> Result<PathBuf, String> {
+    let path = PathBuf::from(value);
+    if path.is_absolute() {
+        Ok(path)
+    } else {
+        Err("KAREN_WHISPER_MODEL_PATH must be an absolute path".into())
+    }
+}
+
 fn model_path(app: &AppHandle) -> Result<PathBuf, String> {
+    if let Ok(path) = std::env::var("KAREN_WHISPER_MODEL_PATH") {
+        return validate_model_override(&path);
+    }
     let dir = app
         .path()
         .app_data_dir()
         .map_err(|e| format!("could not resolve app data dir: {e}"))?
         .join("whisper");
     Ok(dir.join(model_filename()))
+}
+
+fn is_local_model_override() -> bool {
+    std::env::var("KAREN_WHISPER_MODEL_PATH").is_ok()
 }
 
 const DOWNLOAD_ATTEMPTS: u32 = 10;
@@ -135,6 +151,10 @@ async fn ensure_model_downloaded(app: &AppHandle) -> Result<PathBuf, String> {
         return Ok(path);
     }
 
+    if is_local_model_override() {
+        return Err(format!("configured Whisper model does not exist: {}", path.display()));
+    }
+
     let dir = path.parent().ok_or("invalid model path")?;
     tokio::fs::create_dir_all(dir)
         .await
@@ -217,4 +237,15 @@ pub async fn transcribe(ctx: Arc<WhisperContext>, mono_16k: Vec<f32>) -> Result<
     })
     .await
     .map_err(|e| format!("whisper transcription task panicked: {e}"))?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_model_override;
+
+    #[test]
+    fn model_override_requires_absolute_path() {
+        assert!(validate_model_override("/tmp/ggml-base.en.bin").is_ok());
+        assert!(validate_model_override("models/ggml-base.en.bin").is_err());
+    }
 }

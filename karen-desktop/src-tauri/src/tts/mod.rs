@@ -120,7 +120,9 @@ pub fn init() {
                     let _ = play_tx.send(PlaybackCommand::Wait(tx)).await;
                 }
                 TtsCommand::Cancel => {
-                    CURRENT_GENERATION.fetch_add(1, Ordering::SeqCst);
+                    // The generation is advanced synchronously in `cancel`.
+                    // Keeping this arm as a queue drain signal avoids changing
+                    // the playback worker protocol without incrementing twice.
                 }
             }
         }
@@ -138,6 +140,9 @@ pub fn speak_chunk(text: String, speech_ended_at: Option<std::time::Instant>, ut
 }
 
 pub fn cancel() {
+    // Advance before returning so callers that immediately capture the new
+    // generation cannot race the asynchronous TTS worker.
+    CURRENT_GENERATION.fetch_add(1, Ordering::SeqCst);
     if let Some(tx) = TTS_TX.get() {
         let _ = tx.send(TtsCommand::Cancel);
     }
