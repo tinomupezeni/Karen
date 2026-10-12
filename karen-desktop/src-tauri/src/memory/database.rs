@@ -77,10 +77,12 @@ impl Database {
                 description TEXT NOT NULL,
                 status TEXT DEFAULT 'open',
                 deadline DATETIME,
+                result TEXT,
                 recorded_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )",
             [],
         )?;
+        let _ = conn.execute("ALTER TABLE tasks ADD COLUMN result TEXT", []);
 
         conn.execute(
             "CREATE TABLE IF NOT EXISTS events (

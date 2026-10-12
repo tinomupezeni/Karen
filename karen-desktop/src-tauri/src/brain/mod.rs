@@ -1,6 +1,7 @@
 mod devlogs;
 mod open_app;
 mod browse_files;
+mod router;
 pub mod tools;
 
 use serde::{Deserialize, Serialize};
@@ -14,6 +15,15 @@ const DEFAULT_MODEL: &str = "openai/gpt-oss-120b";
 const DEFAULT_CONTEXT_MESSAGES: usize = 10;
 const MAX_CONTEXT_MESSAGE_CHARS: usize = 4000;
 const MAX_TTS_CHUNK_CHARS: usize = 160;
+const DEFAULT_LATENCY_BUDGET_MS: u64 = 8_000;
+
+fn latency_budget_ms() -> u64 {
+    std::env::var("KAREN_LATENCY_BUDGET_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| (500..=120_000).contains(value))
+        .unwrap_or(DEFAULT_LATENCY_BUDGET_MS)
+}
 
 fn context_message_limit() -> usize {
     std::env::var("KAREN_CONTEXT_MESSAGES")
@@ -55,11 +65,45 @@ fn next_tts_boundary(text: &str, start: usize) -> Option<usize> {
     }
     None
 }
+
+fn background_request(text: &str) -> Option<&str> {
+    let text = text.trim();
+    ["run this in the background: ", "work on this in the background: ", "keep working on: "]
+        .iter().find_map(|prefix| text.strip_prefix(prefix)).filter(|rest| !rest.trim().is_empty())
+}
+
+async fn start_background_task(request: &str, app: &AppHandle, current_gen_id: usize) -> Option<String> {
+    let memory = app.state::<crate::memory::MemoryEngine>();
+    let task_id = {
+        let db = memory.db.lock().await;
+        db.create_task(request).ok()?
+    };
+    let task_for_worker = task_id.clone();
+    let worker_app = app.clone();
+    let worker_request = request.to_string();
+    std::thread::spawn(move || tauri::async_runtime::block_on(async move {
+        {
+            let memory = worker_app.state::<crate::memory::MemoryEngine>();
+            let db = memory.db.lock().await;
+            let _ = db.update_task(&task_for_worker, "running", None);
+        }
+        let result = run_agentic(&worker_request, &worker_app, None, current_gen_id).await;
+        let (status, output) = match result {
+            Ok(answer) => ("completed", answer),
+            Err(error) => ("failed", error),
+        };
+        let memory = worker_app.state::<crate::memory::MemoryEngine>();
+        let db = memory.db.lock().await;
+        let _ = db.update_task(&task_for_worker, status, Some(&output));
+        let _ = worker_app.emit("karen-task", json!({"task_id": task_for_worker, "status": status, "result": output}));
+    }));
+    Some(task_id)
+}
 const MAX_ITERS: usize = 5;
 
 const PERSONA_PATH_ENV: &str = "KAREN_PERSONA_PATH";
 const DEFAULT_PERSONA_PATH: &str = "/home/shadowe/Projects/Karen/Persona.md";
-const FALLBACK_PERSONA: &str = "You are Karen, a voice-activated desktop assistant.";
+const FALLBACK_PERSONA: &str = "You are Friday, a voice-activated desktop assistant.";
 static HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 
 fn http_client() -> Result<&'static reqwest::Client, String> {
@@ -230,10 +274,66 @@ fn emit_running_tool(app: &AppHandle, name: &str, gen_id: usize) {
     }
 }
 
+/// Every fast, non-streamed reply path (deterministic routing, canned
+/// greetings, background-task acknowledgements) must still reach TTS the
+/// same way a streamed LLM answer does -- otherwise the HUD shows text with
+/// no audio, which looks identical to Friday being broken.
+fn speak_now(text: String, speech_ended_at: Option<std::time::Instant>, gen_id: usize) -> String {
+    let utterance_id = format!("u-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis());
+    crate::tts::speak_chunk(text.clone(), speech_ended_at, utterance_id, 0, gen_id);
+    text
+}
+
 pub async fn run_agentic(transcript: &str, app: &AppHandle, speech_ended_at: Option<std::time::Instant>, current_gen_id: usize) -> Result<String, String> {
+    if let Some(reply) = router::fast_reply(transcript) {
+        return Ok(speak_now(reply, speech_ended_at, current_gen_id));
+    }
+    if let Some(request) = background_request(transcript) {
+        if let Some(task_id) = start_background_task(request, app, current_gen_id).await {
+            let reply = format!("I’ve queued that as task {task_id}. Ask me for its status when you’re ready.");
+            return Ok(speak_now(reply, speech_ended_at, current_gen_id));
+        }
+        return Err("I couldn’t create a background task record.".into());
+    }
+    if let Some(route) = router::route(transcript) {
+        match route {
+            router::Route::StopPlayback => {
+                // Mirrors pipeline.rs's own cancel handling: stay silent so
+                // Friday doesn't talk over the "stop" the user just gave.
+                crate::tts::cancel();
+                return Ok("Playback stopped. I’m listening.".into());
+            }
+            router::Route::SystemInfo => {
+                let result = tools::dispatch("get_system_info", "{}", app).await;
+                let reply = format_routed_result("System status", result);
+                return Ok(speak_now(reply, speech_ended_at, current_gen_id));
+            }
+            router::Route::SetVolume(percent) => {
+                let result = tools::dispatch("set_volume", &json!({"percent": percent}).to_string(), app).await;
+                let reply = format_routed_result("Volume", result);
+                return Ok(speak_now(reply, speech_ended_at, current_gen_id));
+            }
+            router::Route::OpenApp(name) => {
+                let result = tools::dispatch("open_app", &json!({"name": name}).to_string(), app).await;
+                let reply = format_routed_result("Application", result);
+                return Ok(speak_now(reply, speech_ended_at, current_gen_id));
+            }
+        }
+    }
+
+    let budget = std::time::Duration::from_millis(latency_budget_ms());
+    let deadline = std::time::Instant::now() + budget;
     let provider = std::env::var("KAREN_LLM_PROVIDER").unwrap_or_else(|_| "groq".into());
     let use_ollama = provider.eq_ignore_ascii_case("ollama");
-    let api_key = if use_ollama { None } else { Some(std::env::var("GROQ_API_KEY").map_err(|_| "GROQ_API_KEY is not set".to_string())?) };
+    let groq_keys = if use_ollama {
+        Vec::new()
+    } else {
+        let keys = crate::groq_keys::ordered_keys();
+        if keys.is_empty() {
+            return Err("GROQ_API_KEY is not set".to_string());
+        }
+        keys
+    };
     let model = if use_ollama {
         std::env::var("KAREN_OLLAMA_MODEL").unwrap_or_else(|_| "qwen2.5:3b".into())
     } else {
@@ -340,6 +440,10 @@ pub async fn run_agentic(transcript: &str, app: &AppHandle, speech_ended_at: Opt
     let client = http_client()?;
 
     for _ in 0..MAX_ITERS {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(format!("request exceeded its {}ms latency budget", budget.as_millis()));
+        }
         let request = ChatRequest {
             model: &model,
             messages: &messages,
@@ -354,20 +458,49 @@ pub async fn run_agentic(transcript: &str, app: &AppHandle, speech_ended_at: Opt
         let body = serde_json::to_vec(&request).map_err(|e| format!("failed to encode request: {e}"))?;
         log::debug!("{} request body: {} bytes", if use_ollama { "Ollama" } else { "Groq" }, body.len());
 
-        let mut request = client
-            .post(&endpoint)
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .body(body);
-        if let Some(key) = &api_key {
-            request = request.bearer_auth(key);
-        }
-        let mut response = request.send().await.map_err(|e| format!("LLM request failed: {e}"))?;
+        // Groq keys rotate round-robin with failover on 401/403/429; Ollama
+        // needs no key and always makes a single attempt.
+        let attempts: Vec<Option<String>> = if use_ollama {
+            vec![None]
+        } else {
+            groq_keys.iter().cloned().map(Some).collect()
+        };
+        let mut response = None;
+        for (attempt_idx, key) in attempts.iter().enumerate() {
+            let mut request_builder = client
+                .post(&endpoint)
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .body(body.clone());
+            if let Some(key) = key {
+                request_builder = request_builder.bearer_auth(key);
+            }
+            let attempt = tokio::time::timeout(remaining, request_builder.send())
+                .await
+                .map_err(|_| format!("request exceeded its {}ms latency budget", budget.as_millis()))?
+                .map_err(|e| format!("LLM request failed: {e}"))?;
 
-        let status = response.status();
-        if !status.is_success() {
-            let text = response.text().await.unwrap_or_default();
+            let status = attempt.status();
+            if status.is_success() {
+                response = Some(attempt);
+                break;
+            }
+            let text = attempt.text().await.unwrap_or_default();
+            let more_keys = attempt_idx + 1 < attempts.len();
+            if !use_ollama && more_keys && crate::groq_keys::should_try_next_key(status.as_u16()) {
+                log::warn!(
+                    "Groq LLM key {}/{} rejected ({}), rotating to next key",
+                    attempt_idx + 1,
+                    attempts.len(),
+                    status
+                );
+                continue;
+            }
             return Err(format!("LLM provider returned {status}: {text}"));
         }
+        let mut response = match response {
+            Some(response) => response,
+            None => return Err("LLM provider returned no usable response".to_string()),
+        };
 
         let mut accumulated_content = String::new();
         let mut accumulated_tool_calls: Vec<ToolCall> = Vec::new();
@@ -378,7 +511,13 @@ pub async fn run_agentic(transcript: &str, app: &AppHandle, speech_ended_at: Opt
         let mut acknowledgement_spoken = false;
         let utterance_id = format!("u-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis());
 
-        while let Some(chunk) = response.chunk().await.map_err(|e| format!("stream error: {e}"))? {
+        while let Some(chunk) = tokio::time::timeout(
+            deadline.saturating_duration_since(std::time::Instant::now()),
+            response.chunk(),
+        )
+        .await
+        .map_err(|_| format!("request exceeded its {}ms latency budget", budget.as_millis()))?
+        .map_err(|e| format!("stream error: {e}"))? {
             // Check if cancelled
             if current_gen_id != crate::tts::get_current_generation() {
                 log::info!("LLM generation cancelled by user interruption.");
@@ -433,7 +572,16 @@ pub async fn run_agentic(transcript: &str, app: &AppHandle, speech_ended_at: Opt
                                         }
                                         let active_tc = &mut accumulated_tool_calls[tc.index];
                                         if let Some(ref id) = tc.id { active_tc.id.push_str(id); }
-                                        if let Some(ref kind) = tc.kind { active_tc.kind.push_str(kind); }
+                                        // Unlike `name`/`arguments`, which genuinely arrive as
+                                        // string fragments to be concatenated, `type` is always
+                                        // sent as a complete value ("function") -- some providers
+                                        // resend it on every delta for the same tool call, not
+                                        // just the first. `push_str`-ing it like a fragment turned
+                                        // repeated "function" deltas into "functionfunction", which
+                                        // Groq's strict enum validation on `tool_calls[].type`
+                                        // rejected with a 400 on the next request that replayed
+                                        // this message as history. Assign, don't accumulate.
+                                        if let Some(ref kind) = tc.kind { active_tc.kind = kind.clone(); }
                                         if let Some(ref f) = tc.function {
                                             if let Some(ref n) = f.name { active_tc.function.name.push_str(n); }
                                             if let Some(ref a) = f.arguments { active_tc.function.arguments.push_str(a); }
@@ -476,6 +624,11 @@ pub async fn run_agentic(transcript: &str, app: &AppHandle, speech_ended_at: Opt
         }
 
         for call in tool_calls {
+            if !tool_call_allowed(transcript, &call.function.name) {
+                log::warn!("blocked tool call without explicit user intent: {}", call.function.name);
+                messages.push(Message::tool_result(call.id, call.function.name.clone(), json!({"ok": false, "error": "tool call blocked because the original request did not explicitly ask for this action"})));
+                continue;
+            }
             emit_running_tool(app, &call.function.name, current_gen_id);
             if !acknowledgement_spoken && accumulated_content.trim().is_empty() {
                 crate::tts::speak_chunk(
@@ -496,6 +649,21 @@ pub async fn run_agentic(transcript: &str, app: &AppHandle, speech_ended_at: Opt
     Err("gave up after several tool-calling iterations without a final answer".to_string())
 }
 
+fn format_routed_result(label: &str, result: Value) -> String {
+    if result.get("confirmation_required").and_then(Value::as_bool).unwrap_or(false) {
+        return result.get("message").and_then(Value::as_str).unwrap_or("Confirmation required.").to_string();
+    }
+    if result.get("ok").and_then(Value::as_bool) == Some(true) {
+        match label {
+            "Volume" => format!("Volume set to {} percent.", result.get("percent").and_then(Value::as_i64).unwrap_or(0)),
+            "Application" => format!("Opened {}.", result.get("opened").and_then(Value::as_str).unwrap_or("the application")),
+            _ => format!("{label} checked."),
+        }
+    } else {
+        result.get("error").and_then(Value::as_str).map(|e| format!("{label} failed: {e}")).unwrap_or_else(|| format!("{label} failed."))
+    }
+}
+
 fn tool_acknowledgement(name: &str) -> &'static str {
     match name {
         "open_app" | "open_url" => "Opening that now.",
@@ -507,9 +675,32 @@ fn tool_acknowledgement(name: &str) -> &'static str {
     }
 }
 
+fn tool_call_allowed(original_request: &str, name: &str) -> bool {
+    if matches!(name, "read_file" | "list_directory" | "get_system_info" | "list_processes" | "get_current_time" | "search_events" | "list_tasks" | "get_task" | "screen_ocr" | "take_screenshot") { return true; }
+    let text = original_request.to_ascii_lowercase();
+    // Namespaced MCP tools (browser operate/read/research): allowed when the
+    // request is observably a look-something-up errand.
+    if name.starts_with("mcp__") {
+        return ["research", "search", "look up", "lookup", "browse", "open",
+            "visit", "go to", "check", "read", "find", "compare", "look at",
+            "what is", "what are", "what was", "how to"]
+            .iter()
+            .any(|v| text.contains(v));
+    }
+    match name {
+        "open_app" => ["open", "launch", "start"].iter().any(|v| text.contains(v)),
+        "open_url" => text.contains("open") || text.contains("visit") || text.contains("go to"),
+        "set_volume" => text.contains("volume") || text.contains("sound") || text.contains("mute"),
+        "press_key" | "type_text" => text.contains("type") || text.contains("press") || text.contains("write"),
+        "save_memory" => text.contains("remember") || text.contains("save this") || text.contains("note that"),
+        "create_task" => text.contains("task") || text.contains("background") || text.contains("work on"),
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{needs_semantic_memory, tool_acknowledgement};
+    use super::{background_request, needs_semantic_memory, tool_acknowledgement, tool_call_allowed};
 
     #[test]
     fn semantic_lookup_is_reserved_for_memory_questions() {
@@ -524,4 +715,18 @@ mod tests {
         assert_eq!(tool_acknowledgement("open_app"), "Opening that now.");
         assert!(tool_acknowledgement("unknown").chars().count() < 40);
     }
+
+    #[test]
+    fn blocks_implicit_mutations_but_allows_explicit_actions() {
+        assert!(!tool_call_allowed("tell me about my system", "type_text"));
+        assert!(tool_call_allowed("open VS Code", "open_app"));
+        assert!(tool_call_allowed("what is my system status", "get_system_info"));
+    }
+
+    #[test]
+    fn recognizes_explicit_background_requests_only() {
+        assert_eq!(background_request("run this in the background: inspect the logs"), Some("inspect the logs"));
+        assert_eq!(background_request("inspect the logs"), None);
+    }
+
 }

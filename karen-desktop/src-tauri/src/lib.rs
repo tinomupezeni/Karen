@@ -2,6 +2,9 @@ mod audio;
 mod brain;
 mod context_engine;
 mod config;
+mod gesture;
+mod groq_keys;
+mod mcp;
 mod memory;
 mod pipeline;
 mod resample;
@@ -212,6 +215,17 @@ fn cancel_pending_tool() -> serde_json::Value {
     brain::tools::cancel_pending()
 }
 
+#[tauri::command]
+fn set_gesture_enabled(enabled: bool) -> bool {
+    crate::gesture::set_enabled(enabled);
+    enabled
+}
+
+#[tauri::command]
+fn get_gesture_enabled() -> bool {
+    crate::gesture::is_enabled()
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     if let Ok(path) = dotenvy::dotenv() {
@@ -264,7 +278,7 @@ pub fn run() {
                 })
                 .build(),
         )
-        .invoke_handler(tauri::generate_handler![toggle_mic_command, set_tts_provider, set_llm_provider, check_ollama, confirm_pending_tool, cancel_pending_tool])
+        .invoke_handler(tauri::generate_handler![toggle_mic_command, set_tts_provider, set_llm_provider, check_ollama, confirm_pending_tool, cancel_pending_tool, set_gesture_enabled, get_gesture_enabled])
         .setup(move |app| {
             crate::tts::init();
             let show = MenuItemBuilder::with_id("show", "Show Karen").build(app)?;
@@ -282,6 +296,7 @@ pub fn run() {
                     }
                     "quit" => {
                         crate::tts::cancel();
+                        crate::gesture::stop();
                         app.exit(0);
                     }
                     _ => {}
@@ -308,6 +323,18 @@ pub fn run() {
                     Ok(_) => log::info!("Whisper warmed during startup in {:?}", started.elapsed()),
                     Err(e) => log::warn!("Whisper warm-up failed; it will retry on first command: {e}"),
                 }
+            });
+
+            // Gesture sidecar supervisor (no-op unless FRIDAY_GESTURE_ENABLED).
+            // The sidecar is a sensor only (--dry-run); Friday maps gestures
+            // to safe actions here. See gesture.rs.
+            let gesture_app = app.handle().clone();
+            std::thread::spawn(move || crate::gesture::supervise(gesture_app));
+
+            // MCP tool servers (no-op unless configured). Curated external
+            // capabilities such as the Playwright browser. See mcp.rs.
+            tauri::async_runtime::spawn(async move {
+                crate::mcp::supervise().await;
             });
 
             wake(app.handle());

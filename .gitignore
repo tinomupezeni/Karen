@@ -49,3 +49,16 @@ wheels/
 
 # Project specific exclusions
 karen_finetune_dataset.jsonl
+
+# Python virtualenvs / caches (friday-gesture)
+.venv/
+__pycache__/
+
+# Downloaded ML model assets (fetched at setup time, not vendored --
+# consistent with Whisper models, which are also runtime-downloaded)
+friday-gesture/models/
+
+# Aider tool state (local coding-assistant scratch files, not project content)
+.aider.chat.history.md
+.aider.input.history
+.aider.tags.cache.v4/

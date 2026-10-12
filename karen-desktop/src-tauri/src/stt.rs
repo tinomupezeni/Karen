@@ -1,11 +1,32 @@
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::Mutex as AsyncMutex;
-use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
+use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters, WhisperState};
 
 pub struct WhisperHandle(pub AsyncMutex<Option<Arc<WhisperContext>>>);
+
+// `WhisperState` owns ~100MB+ of its own compute buffers (kv-cache, encode/
+// decode scratch space) independent of `WhisperContext`. Calling
+// `ctx.create_state()` fresh on every single utterance was re-allocating all
+// of that on every turn -- a fixed cost that dominated latency for short
+// clips (a 9.7s capture and a 1.6s capture were taking nearly the same wall
+// time to transcribe, which only makes sense if most of it was a per-call
+// fixed cost, not decode time proportional to audio length). The model is
+// never swapped at runtime, so one process-lifetime state is safe to reuse.
+static CACHED_STATE: OnceLock<Mutex<WhisperState>> = OnceLock::new();
+
+fn cached_state(ctx: &WhisperContext) -> Result<&'static Mutex<WhisperState>, String> {
+    if let Some(state) = CACHED_STATE.get() {
+        return Ok(state);
+    }
+    let state = ctx
+        .create_state()
+        .map_err(|e| format!("failed to create whisper state: {e}"))?;
+    let _ = CACHED_STATE.set(Mutex::new(state));
+    Ok(CACHED_STATE.get().expect("just set"))
+}
 
 const MODEL_BASE_URL: &str = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/";
 const DEFAULT_MODEL: &str = "ggml-tiny.en.bin";
@@ -206,9 +227,14 @@ pub async fn ensure_loaded(app: &AppHandle) -> Result<Arc<WhisperContext>, Strin
 
 pub async fn transcribe(ctx: Arc<WhisperContext>, mono_16k: Vec<f32>) -> Result<String, String> {
     tokio::task::spawn_blocking(move || {
-        let mut state = ctx
-            .create_state()
-            .map_err(|e| format!("failed to create whisper state: {e}"))?;
+        let state_lock = cached_state(&ctx)?;
+        let mut state = state_lock
+            .lock()
+            .map_err(|_| "whisper state lock poisoned".to_string())?;
+
+        let n_threads = std::thread::available_parallelism()
+            .map(|n| n.get() as std::os::raw::c_int)
+            .unwrap_or(4);
 
         let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
         params.set_language(Some("en"));
@@ -216,10 +242,34 @@ pub async fn transcribe(ctx: Arc<WhisperContext>, mono_16k: Vec<f32>) -> Result<
         params.set_print_special(false);
         params.set_print_realtime(false);
         params.set_print_timestamps(false);
+        // Every capture here is one short voice command, never a long
+        // recording, so there is no benefit to whisper.cpp's multi-segment
+        // boundary detection or carrying decode context between calls --
+        // both add work for nothing on a clip this short. Explicitly using
+        // every available core also removes any dependence on whisper.cpp's
+        // own default thread count, which this crate never overrode before.
+        params.set_n_threads(n_threads);
+        params.set_single_segment(true);
+        params.set_no_context(true);
+        // whisper.cpp's encoder always runs over a fixed, zero-padded
+        // context window (1500 units = 30s) regardless of actual speech
+        // length -- a 1-second "hi" and a 20-second sentence measured
+        // almost identical inference time before this, confirming nearly
+        // all of it was encoding padding, not real audio. Friday's captures
+        // are always short voice commands (capped at MAX_SPEECH_SECS in
+        // audio.rs), so size the context to what was actually captured
+        // instead. 50 units/sec; generous headroom (+3s, 6s floor) guards
+        // against clipping real speech given this whisper-rs API is marked
+        // experimental.
+        let duration_secs = mono_16k.len() as f32 / 16_000.0;
+        let audio_ctx = (((duration_secs * 50.0) as i32) + 150).clamp(300, 1500);
+        params.set_audio_ctx(audio_ctx);
 
+        let inference_started = std::time::Instant::now();
         state
             .full(params, &mono_16k)
             .map_err(|e| format!("whisper inference failed: {e}"))?;
+        log::info!("whisper inference ({n_threads} threads) took {:?}", inference_started.elapsed());
 
         let n_segments = state.full_n_segments();
 

@@ -13,7 +13,7 @@ impl VoiceConfig {
             .ok()
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| "karen".into());
+            .unwrap_or_else(|| "friday".into());
         Self { wake_word_enabled, wake_word }
     }
 }
@@ -24,8 +24,8 @@ mod tests {
 
     #[test]
     fn uses_safe_voice_defaults() {
-        let config = VoiceConfig { wake_word_enabled: false, wake_word: "karen".into() };
+        let config = VoiceConfig { wake_word_enabled: false, wake_word: "friday".into() };
         assert!(!config.wake_word_enabled);
-        assert_eq!(config.wake_word, "karen");
+        assert_eq!(config.wake_word, "friday");
     }
 }

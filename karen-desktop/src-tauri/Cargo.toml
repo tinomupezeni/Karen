@@ -35,6 +35,17 @@ sysinfo = "0.38.4"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 uuid = { version = "1.27.0", features = ["v4"] }
 async-trait = "0.1.92"
+rmcp = { version = "3", default-features = false, features = ["client", "transport-child-process"] }
 
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 tauri-plugin-global-shortcut = "2"
+
+# whisper.cpp's C/C++ inference kernels are compiled by whisper-rs-sys's
+# build script, which otherwise inherits the dev profile's -O0. That makes
+# every Whisper transcription (even on the tiny model) an order of
+# magnitude slower in `tauri dev` than a release build -- this is the
+# actual cause of multi-second STT turnaround observed in dev, not a model
+# or VAD problem. Force just this dependency to build optimized regardless
+# of profile; Rust-side rebuild-on-change in the rest of the app stays fast.
+[profile.dev.package.whisper-rs-sys]
+opt-level = 3

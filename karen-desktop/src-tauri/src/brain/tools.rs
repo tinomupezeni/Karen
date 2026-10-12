@@ -119,10 +119,19 @@ impl ToolRisk {
 }
 
 pub fn risk_for(name: &str) -> ToolRisk {
+    // Namespaced MCP tools: read-only observations auto-run, everything
+    // else confirms through the normal gate. See mcp.rs for the policy.
+    if let Some((server, tool)) = crate::mcp::split_qualified(name) {
+        return if crate::mcp::is_read_only_action(&server, &tool) {
+            ToolRisk::AutoRun
+        } else {
+            ToolRisk::ConfirmRequired
+        };
+    }
     match name {
         // These tools only inspect local state or update Karen's own memory.
         "list_directory" | "read_file" | "list_dev_logs" | "read_dev_logs"
-        | "get_current_time" | "search_events" | "save_memory" => ToolRisk::AutoRun,
+        | "get_current_time" | "search_events" | "save_memory" | "create_task" | "get_task" | "list_tasks" => ToolRisk::AutoRun,
         // Launching an application changes desktop state and will become
         // confirmation-aware when the UI confirmation flow is added.
         "open_app" => ToolRisk::ConfirmRequired,
@@ -338,10 +347,15 @@ pub fn all_tool_defs() -> Vec<Value> {
                 }
             }
         }),
+        json!({"type":"function","function":{"name":"create_task","description":"Create a persistent background task record for work that cannot finish in the current voice turn.","parameters":{"type":"object","properties":{"description":{"type":"string"}},"required":["description"]}}}),
+        json!({"type":"function","function":{"name":"get_task","description":"Retrieve the status and result of a background task by ID.","parameters":{"type":"object","properties":{"task_id":{"type":"string"}},"required":["task_id"]}}}),
+        json!({"type":"function","function":{"name":"list_tasks","description":"List recent background tasks and their statuses.","parameters":{"type":"object","properties":{"limit":{"type":"integer"}}}}}),
     ];
 
     // Keep risk metadata beside the canonical tool definitions so the model,
     // UI, and executor can share one registry as the action surface grows.
+    // MCP tools are appended first so they receive x-risk too.
+    definitions.extend(crate::mcp::tool_defs());
     for definition in &mut definitions {
         if let Some(function) = definition.get_mut("function") {
             if let Some(name) = function.get("name").and_then(Value::as_str) {
@@ -356,6 +370,7 @@ pub fn all_tool_defs() -> Vec<Value> {
 use super::browse_files;
 mod system;
 mod memory;
+mod tasks;
 
 pub async fn dispatch(name: &str, args_json: &str, app: &tauri::AppHandle) -> Value {
     dispatch_inner(name, args_json, app, false).await
@@ -418,6 +433,10 @@ async fn dispatch_inner(name: &str, args_json: &str, app: &tauri::AppHandle, con
             })
         },
         "search_events" => memory::search_events(parsed.clone(), app).await,
+        "create_task" => tasks::create(parsed.clone(), app).await,
+        "get_task" => tasks::get(parsed.clone(), app).await,
+        "list_tasks" => tasks::list(parsed.clone(), app).await,
+        other if other.starts_with("mcp__") => crate::mcp::call_tool(other, parsed.clone()).await,
         other => json!({ "ok": false, "error": format!("unknown tool: {other}") }),
     };
 

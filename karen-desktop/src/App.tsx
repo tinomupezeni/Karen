@@ -12,17 +12,18 @@ type PushToTalkEvent = { active: boolean };
 function App() {
   const [orbState, setOrbState] = useState<OrbState>("listening")
   const [isMuted, setIsMuted] = useState(false)
-  const [displayText, setDisplayText] = useState("Karen is listening...")
+  const [displayText, setDisplayText] = useState("Friday is listening...")
   const [ttsProvider, setTtsProvider] = useState(() => {
     const saved = localStorage.getItem("karen.ttsProvider")
     return saved === "piper" || saved === "groq" || saved === "auto" ? saved : "auto"
   })
   const [confirmationPending, setConfirmationPending] = useState(false)
+  const [gestureEnabled, setGestureEnabled] = useState(() => localStorage.getItem("karen.gestureEnabled") === "true")
   const [llmProvider, setLlmProvider] = useState(() => localStorage.getItem("karen.llmProvider") ?? "groq")
   const [llmModel, setLlmModel] = useState(() => localStorage.getItem("karen.llmModel") ?? (llmProvider === "ollama" ? "qwen2.5:3b" : "openai/gpt-oss-120b"))
   const [missionLog, setMissionLog] = useState<string[]>(["KAREN CORE INITIALIZED", "VOICE LINK STANDING BY"])
   const [lastCommand, setLastCommand] = useState("Awaiting your instruction, Tino.")
-  const [lastResponse, setLastResponse] = useState("Karen is online and listening.")
+  const [lastResponse, setLastResponse] = useState("Friday is online and listening.")
   const [latencyText, setLatencyText] = useState("Awaiting first response")
 
   useEffect(() => {
@@ -35,6 +36,11 @@ function App() {
     localStorage.setItem("karen.llmProvider", llmProvider)
     localStorage.setItem("karen.llmModel", llmModel)
   }, [llmProvider, llmModel])
+
+  useEffect(() => {
+    void invoke('set_gesture_enabled', { enabled: gestureEnabled })
+    localStorage.setItem("karen.gestureEnabled", String(gestureEnabled))
+  }, [gestureEnabled])
 
   useEffect(() => {
     const unlistenWake = listen('wake-karen', () => {
@@ -95,7 +101,7 @@ function App() {
           break;
         case "speaking":
           setOrbState("composing");
-          setDisplayText("Karen is speaking…");
+          setDisplayText("Friday is speaking…");
           break;
         case "wake-followup":
         case "listening":
@@ -132,7 +138,7 @@ function App() {
   return (
     <div style={{ minHeight: '100vh', width: '100vw', boxSizing: 'border-box', padding: '28px 34px', color: '#d9faff', fontFamily: 'Inter, system-ui, sans-serif', background: 'radial-gradient(circle at 50% 42%, rgba(0, 171, 214, .16), transparent 28%), linear-gradient(135deg, #03070d, #071521 55%, #02050a)', overflow: 'hidden' }}>
       <header style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', borderBottom: '1px solid rgba(78, 216, 255, .22)', paddingBottom: '14px' }}>
-        <div><div style={{ fontSize: '11px', letterSpacing: '4px', color: '#52dfff' }}>KAREN // PERSONAL SYSTEM</div><div style={{ fontSize: '25px', letterSpacing: '2px', marginTop: '5px' }}>MISSION CONTROL</div></div>
+        <div><div style={{ fontSize: '11px', letterSpacing: '4px', color: '#52dfff' }}>FRIDAY // PERSONAL SYSTEM</div><div style={{ fontSize: '25px', letterSpacing: '2px', marginTop: '5px' }}>MISSION CONTROL</div></div>
         <div style={{ textAlign: 'right', fontSize: '11px', color: '#78aebc' }}><div style={{ color: '#72f4ca' }}>● SYSTEMS NOMINAL</div><div>TINO // OPERATOR</div></div>
       </header>
 
@@ -167,7 +173,7 @@ function App() {
         <div style={{ color: '#52dfff', letterSpacing: '2px', fontSize: '10px', marginBottom: '9px' }}>LIVE DIALOGUE</div>
         <div style={{ color: '#82aeb7', fontSize: '11px', marginBottom: '5px' }}>TINO <span style={{ color: '#426d79' }}>// command</span></div>
         <div style={{ color: '#d7faff', fontSize: '13px', marginBottom: '12px' }}>{lastCommand}</div>
-        <div style={{ color: '#72f4ca', fontSize: '11px', marginBottom: '5px' }}>KAREN <span style={{ color: '#426d79' }}>// response</span></div>
+        <div style={{ color: '#72f4ca', fontSize: '11px', marginBottom: '5px' }}>FRIDAY <span style={{ color: '#426d79' }}>// response</span></div>
         <div style={{ color: '#b7dce2', fontSize: '13px', maxHeight: '44px', overflow: 'hidden' }}>{lastResponse}</div>
         <div aria-label="Voice activity" style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '4px', height: '24px', marginTop: '13px', opacity: isMuted ? .3 : 1 }}>
           {Array.from({ length: 18 }, (_, index) => <span key={index} style={{ width: '3px', height: `${6 + ((index * 7) % 15)}px`, borderRadius: '3px', background: index % 3 === 0 ? '#72f4ca' : '#36d8f5', boxShadow: '0 0 8px #2ad8f577', animation: `wave ${.55 + (index % 5) * .09}s ease-in-out infinite alternate`, animationDelay: `${index * -.06}s` }} />)}
@@ -176,6 +182,7 @@ function App() {
 
       <footer style={{ display: 'flex', justifyContent: 'center', gap: '12px', flexWrap: 'wrap', color: '#83b7c0', fontSize: '12px' }}>
       <button onClick={() => invoke('toggle_mic_command').then(() => setIsMuted((value) => !value))}>{isMuted ? 'Enable mic' : 'Mute mic'}</button>
+      <button onClick={() => setGestureEnabled((value) => !value)}>{gestureEnabled ? 'Disable gestures' : 'Enable gestures'}</button>
       <button onClick={() => { setLastResponse('Standing by for your next instruction, Tino.'); setDisplayText('Ready for command.'); }}>Reset status</button>
 
       <label style={{ color: '#bbb', fontSize: '12px' }}>

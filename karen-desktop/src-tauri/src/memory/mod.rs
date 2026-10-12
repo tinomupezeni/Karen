@@ -4,6 +4,7 @@ pub mod temporal;
 pub mod semantic;
 pub mod memories;
 pub mod events;
+pub mod tasks;
 
 use std::sync::Arc;
 use tokio::sync::Mutex;

@@ -1,4 +1,4 @@
-# Karen
+# Friday
 
 Karen is a voice-first desktop assistant inspired by JARVIS. She listens through the system microphone, transcribes speech locally with Whisper, reasons with a streaming LLM, operates the computer through guarded tools, and replies with speech. The desktop interface is a Tauri and React dashboard with live status, dialogue, latency, mission events, and confirmation controls.
 

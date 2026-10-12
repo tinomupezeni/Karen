@@ -1,6 +1,6 @@
 use serde_json::json;
 use tauri::{AppHandle, Emitter};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::audio::AudioFormat;
 use crate::{brain, resample, stt, tts};
@@ -8,10 +8,91 @@ use crate::{brain, resample, stt, tts};
 /// Below this, assume the user clicked start/stop without really saying
 /// anything, and skip Whisper/Groq entirely.
 const MIN_RECORDING_SECS: f32 = 0.3;
+/// A missed utterance is only voiced when the capture looked like a real
+/// attempt (not a click or sub-second blip).
+const MISSED_VOICE_MIN_SECS: f32 = 1.0;
+/// Minimum gap between spoken "didn't catch that" replies so a noisy room
+/// cannot make Friday chatter on every VAD misfire.
+const MISSED_VOICE_COOLDOWN_MS: u64 = 30_000;
 static ACTIVE_PIPELINE: AtomicBool = AtomicBool::new(false);
+static LAST_MISSED_VOICE_MS: AtomicU64 = AtomicU64::new(0);
+
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// When Whisper returns no speech, tell the user out loud instead of only
+/// logging it — but stay silent for sub-second blips and rate-limit replies
+/// so background noise cannot trigger a chatter loop.
+fn maybe_voice_missed_reply(audio_duration: f32, speech_ended_at: std::time::Instant, gen_id: usize) {
+    if audio_duration < MISSED_VOICE_MIN_SECS {
+        log::info!("missed reply stays silent: capture too short ({audio_duration:.2}s)");
+        return;
+    }
+    let now = now_millis();
+    let last = LAST_MISSED_VOICE_MS.load(Ordering::SeqCst);
+    if now.saturating_sub(last) < MISSED_VOICE_COOLDOWN_MS {
+        log::info!("missed reply suppressed by cooldown (last voiced {}ms ago)", now.saturating_sub(last));
+        return;
+    }
+    LAST_MISSED_VOICE_MS.store(now, Ordering::SeqCst);
+    let utterance_id = format!("missed-{now}");
+    log::info!("voicing missed reply ({utterance_id})");
+    crate::tts::speak_chunk(
+        "Sorry, I didn't catch that.".to_string(),
+        Some(speech_ended_at),
+        utterance_id,
+        0,
+        gen_id,
+    );
+}
 
 pub fn is_busy() -> bool {
     ACTIVE_PIPELINE.load(Ordering::SeqCst)
+}
+
+/// Turn a raw internal error into something Friday would actually say out
+/// loud, in character, instead of staying silent while the HUD shows a raw
+/// stack-trace-flavored string. Per Persona.md: accurate about what broke,
+/// calm, dryly specific rather than a generic "something went wrong" --
+/// Tino should hear *where* it broke, not just that it did.
+fn in_character_error(e: &str) -> String {
+    let lower = e.to_ascii_lowercase();
+    if lower.contains("groq_api_key is not set") {
+        "I don't have a working language model key configured. I can't think without one.".into()
+    } else if lower.contains("failed to load whisper") || lower.contains("whisper model loading") {
+        "My speech recognition model failed to load. Something's wrong with the model file or its path.".into()
+    } else if lower.contains("whisper inference") || lower.contains("whisper transcription") {
+        "My speech recognizer choked on that audio. I couldn't transcribe it.".into()
+    } else if lower.contains("llm provider returned 400") {
+        "The language model rejected my last request outright, there's a bug in what I sent it. I can't finish that thought.".into()
+    } else if lower.contains("llm provider returned 401") || lower.contains("llm provider returned 403") {
+        "My language model credentials were rejected. I can't reach my own reasoning right now.".into()
+    } else if lower.contains("llm provider returned 429") {
+        "I've hit a rate limit on every key I have. Give it a moment.".into()
+    } else if lower.contains("llm provider returned 5") {
+        "The language model's backend is having a bad day. I can't reach it right now.".into()
+    } else if lower.contains("llm provider returned") {
+        "The language model rejected my request and I don't have a clean read on why.".into()
+    } else if lower.contains("request exceeded") || lower.contains("latency budget") {
+        "That took too long and I had to give up on it.".into()
+    } else if lower.contains("stream error") {
+        "My connection to the language model dropped mid-thought.".into()
+    } else {
+        "Something broke in my reasoning pipeline, and I can't complete that right now.".into()
+    }
+}
+
+/// Speak the in-character line for a pipeline failure. The raw error still
+/// reaches the HUD via `emit_if_current("error", ...)` at the call site, so
+/// nothing is lost for debugging -- this just stops failures from being
+/// completely silent and lifeless to the person talking to Friday.
+fn voice_error(e: &str, speech_ended_at: std::time::Instant, gen_id: usize) {
+    let utterance_id = format!("err-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis());
+    crate::tts::speak_chunk(in_character_error(e), Some(speech_ended_at), utterance_id, 0, gen_id);
 }
 
 /// Whisper emits bracketed/parenthesized markers like `[BLANK_AUDIO]`,
@@ -48,7 +129,7 @@ fn clean_transcript(text: &str) -> Option<String> {
 fn is_cancel_command(text: &str) -> bool {
     matches!(
         normalize_voice_text(text).as_str(),
-        "cancel" | "stop" | "stop talking" | "be quiet" | "never mind" | "nevermind"
+        "cancel" | "stop" | "stop talking" | "stop playback" | "stop the music" | "be quiet" | "never mind" | "nevermind"
     )
 }
 
@@ -72,9 +153,9 @@ fn wake_word_command(text: &str) -> Option<String> {
     let mut tokens = words.split_whitespace();
     let first = tokens.next()?;
 
-    // Whisper commonly turns "Karen" into one of these near matches.
-    let aliases: Vec<String> = if configured == "karen" {
-        ["karen", "karin", "caren", "karrin", "karren"].into_iter().map(String::from).collect()
+    // Whisper commonly turns "Friday" into one of these near matches.
+    let aliases: Vec<String> = if configured == "friday" {
+        ["friday", "fridai", "frida", "frady"].into_iter().map(String::from).collect()
     } else {
         vec![configured.clone()]
     };
@@ -130,28 +211,48 @@ pub async fn run(app: AppHandle, samples: Vec<f32>, format: AudioFormat) -> bool
 
     let mono = resample::downmix_to_mono(&samples, format.channels);
     let mono_16k = resample::resample_linear(&mono, format.sample_rate, 16_000);
+    log::info!(
+        "STT starting: {:.2}s of 16kHz mono ({} samples) from {:.2}s captured at {}Hz/{}ch",
+        mono_16k.len() as f32 / 16_000.0,
+        mono_16k.len(),
+        audio_duration,
+        format.sample_rate,
+        format.channels,
+    );
 
+    let whisper_load_started = std::time::Instant::now();
     let ctx = match stt::ensure_loaded(&app).await {
-        Ok(ctx) => ctx,
+        Ok(ctx) => {
+            log::info!("Whisper ready in {:?}", whisper_load_started.elapsed());
+            ctx
+        }
         Err(e) => {
-            log::error!("failed to load whisper model: {e}");
+            log::error!("failed to load whisper model after {:?}: {e}", whisper_load_started.elapsed());
+            voice_error(&e, speech_ended_at, gen_id);
             emit_if_current("error", Some(&e));
             return false;
         }
     };
 
     let stt_started_at = std::time::Instant::now();
-    let transcript = match stt::transcribe(ctx, mono_16k).await {
-        Ok(text) => match clean_transcript(&text) {
-            Some(text) => text,
-            None => {
-                emit_if_current("idle", Some("Didn't catch that"));
-                return false;
-            }
-        },
+    let raw_transcript = match stt::transcribe(ctx, mono_16k).await {
+        Ok(text) => {
+            log::info!("STT finished in {:?}: raw transcript={:?}", stt_started_at.elapsed(), text);
+            text
+        }
         Err(e) => {
-            log::error!("whisper transcription failed: {e}");
+            log::error!("whisper transcription failed after {:?}: {e}", stt_started_at.elapsed());
+            voice_error(&e, speech_ended_at, gen_id);
             emit_if_current("error", Some(&e));
+            return false;
+        }
+    };
+    let transcript = match clean_transcript(&raw_transcript) {
+        Some(text) => text,
+        None => {
+            log::info!("STT discarded: transcript did not contain speech (raw={raw_transcript:?})");
+            maybe_voice_missed_reply(audio_duration, speech_ended_at, gen_id);
+            emit_if_current("idle", Some("Didn't catch that"));
             return false;
         }
     };
@@ -170,7 +271,7 @@ pub async fn run(app: AppHandle, samples: Vec<f32>, format: AudioFormat) -> bool
                 return true;
             }
             _ => {
-                emit_if_current("idle", Some("Say Karen followed by a command"));
+                emit_if_current("idle", Some("Say Friday followed by a command"));
                 return false;
             }
         }
@@ -203,6 +304,7 @@ pub async fn run(app: AppHandle, samples: Vec<f32>, format: AudioFormat) -> bool
         }
         Err(e) => {
             log::error!("brain loop failed: {e}");
+            voice_error(&e, speech_ended_at, gen_id);
             emit_if_current("error", Some(&e));
             return false;
         }
@@ -227,6 +329,25 @@ pub async fn run(app: AppHandle, samples: Vec<f32>, format: AudioFormat) -> bool
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn voices_distinct_lines_for_distinct_failures() {
+        let key_missing = in_character_error("GROQ_API_KEY is not set");
+        let bad_request = in_character_error("LLM provider returned 400: {\"error\":{}}");
+        let rate_limited = in_character_error("LLM provider returned 429: rate limit");
+        let timeout = in_character_error("request exceeded its 8000ms latency budget");
+        let generic = in_character_error("some never-seen-before failure");
+
+        let all = [&key_missing, &bad_request, &rate_limited, &timeout, &generic];
+        for (i, a) in all.iter().enumerate() {
+            for (j, b) in all.iter().enumerate() {
+                if i != j {
+                    assert_ne!(a, b, "expected distinct in-character lines for distinct failures");
+                }
+            }
+        }
+        assert!(!bad_request.is_empty());
+    }
 
     #[test]
     fn recognizes_whisper_non_speech_markers() {
@@ -254,16 +375,16 @@ mod tests {
         assert!(is_cancel_command("Stop talking"));
         assert!(is_cancel_command("never-mind"));
         assert!(is_cancel_command("CANCEL"));
-        assert!(!is_cancel_command("stop the music"));
+        assert!(is_cancel_command("stop the music"));
     }
 
     #[test]
     fn extracts_wake_word_command() {
-        assert_eq!(wake_word_command("Karen, open the browser"), Some("open the browser".into()));
-        assert_eq!(wake_word_command("karen: what time is it"), Some("what time is it".into()));
-        assert_eq!(wake_word_command("Hey Karen, open the browser"), Some("open the browser".into()));
-        assert_eq!(wake_word_command("okay karin what time is it"), Some("what time is it".into()));
-        assert_eq!(wake_word_command("hello caren"), Some("".into()));
+        assert_eq!(wake_word_command("Friday, open the browser"), Some("open the browser".into()));
+        assert_eq!(wake_word_command("friday: what time is it"), Some("what time is it".into()));
+        assert_eq!(wake_word_command("Hey Friday, open the browser"), Some("open the browser".into()));
+        assert_eq!(wake_word_command("okay fridai what time is it"), Some("what time is it".into()));
+        assert_eq!(wake_word_command("hello frida"), Some("".into()));
         assert_eq!(wake_word_command("open the browser"), None);
     }
 }
