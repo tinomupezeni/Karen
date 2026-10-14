@@ -149,18 +149,16 @@ mod tests {
 
     #[test]
     fn parses_simple_project_name() {
-        let (project, date) =
-            parse_filename("HBEC-2026-09-13-groq-model-retired.md").unwrap();
+        let (project, date) = parse_filename("HBEC-2026-09-13-groq-model-retired.md").unwrap();
         assert_eq!(project, "HBEC");
         assert_eq!(date, "2026-09-13");
     }
 
     #[test]
     fn parses_hyphenated_project_name() {
-        let (project, date) = parse_filename(
-            "tese-marketplace-2026-05-26-production-issues-products-images.md",
-        )
-        .unwrap();
+        let (project, date) =
+            parse_filename("tese-marketplace-2026-05-26-production-issues-products-images.md")
+                .unwrap();
         assert_eq!(project, "tese-marketplace");
         assert_eq!(date, "2026-05-26");
     }
@@ -205,7 +203,10 @@ mod tests {
         .await;
         let files = result["files"].as_array().unwrap();
         for f in files {
-            assert_eq!(f["ok"], false, "traversal attempt should be rejected: {f:?}");
+            assert_eq!(
+                f["ok"], false,
+                "traversal attempt should be rejected: {f:?}"
+            );
         }
     }
 

@@ -43,7 +43,11 @@ pub async fn list_directory(args: Value) -> Value {
         if name.starts_with('.') {
             continue;
         }
-        let is_dir = entry.file_type().await.map(|ft| ft.is_dir()).unwrap_or(false);
+        let is_dir = entry
+            .file_type()
+            .await
+            .map(|ft| ft.is_dir())
+            .unwrap_or(false);
         let kind = if is_dir { "directory" } else { "file" };
         entries.push(json!({ "name": name, "type": kind }));
     }
@@ -63,7 +67,8 @@ pub async fn list_directory(args: Value) -> Value {
     let total = entries.len();
     if total > 50 {
         entries.truncate(50);
-        entries.push(json!({ "name": format!("... and {} more items", total - 50), "type": "info" }));
+        entries
+            .push(json!({ "name": format!("... and {} more items", total - 50), "type": "info" }));
     }
 
     json!({
@@ -89,7 +94,11 @@ pub async fn read_file(args: Value) -> Value {
             // Truncate if too long to avoid blowing up the context window
             let max_chars = 4000;
             let display_content = if content.len() > max_chars {
-                format!("{}... (truncated, {} bytes total)", &content[..max_chars], content.len())
+                format!(
+                    "{}... (truncated, {} bytes total)",
+                    &content[..max_chars],
+                    content.len()
+                )
             } else {
                 content
             };

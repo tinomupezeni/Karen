@@ -8,7 +8,7 @@ pub struct Database {
 impl Database {
     pub fn new(db_path: PathBuf) -> Result<Self> {
         let conn = Connection::open(db_path)?;
-        
+
         // Initial migrations
         conn.execute(
             "CREATE TABLE IF NOT EXISTS conversations (
@@ -90,6 +90,18 @@ impl Database {
                 event_type TEXT NOT NULL,
                 description TEXT NOT NULL,
                 source TEXT,
+                recorded_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )",
+            [],
+        )?;
+
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS artifacts (
+                id TEXT PRIMARY KEY,
+                kind TEXT NOT NULL,
+                path TEXT NOT NULL,
+                source_event_id TEXT,
+                metadata TEXT,
                 recorded_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )",
             [],

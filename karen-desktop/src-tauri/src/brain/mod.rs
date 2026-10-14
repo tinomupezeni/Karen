@@ -1,13 +1,13 @@
+mod browse_files;
 mod devlogs;
 mod open_app;
-mod browse_files;
 mod router;
 pub mod tools;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tauri::{AppHandle, Emitter, Manager};
 use std::sync::OnceLock;
+use tauri::{AppHandle, Emitter, Manager};
 
 const GROQ_CHAT_URL: &str = "https://api.groq.com/openai/v1/chat/completions";
 const DEFAULT_OLLAMA_URL: &str = "http://10.50.101.11:11434/v1/chat/completions";
@@ -44,10 +44,56 @@ fn compact_context_message(content: &str) -> String {
 fn needs_semantic_memory(transcript: &str) -> bool {
     let text = transcript.to_ascii_lowercase();
     [
-        "remember", "memory", "memories", "recall", "forgot", "preference",
-        "yesterday", "last time", "previous", "we worked", "we discussed",
-        "what did we", "my project", "my setup",
-    ].iter().any(|phrase| text.contains(phrase))
+        "remember",
+        "memory",
+        "memories",
+        "recall",
+        "forgot",
+        "preference",
+        "yesterday",
+        "last time",
+        "previous",
+        "we worked",
+        "we discussed",
+        "what did we",
+        "my project",
+        "my setup",
+    ]
+    .iter()
+    .any(|phrase| text.contains(phrase))
+}
+
+/// MCP (Playwright browser) tool definitions are ~24 tools' worth of JSON
+/// schema, resent on every turn that includes them. Background/research
+/// tasks always need them (that's their whole purpose, handled by the
+/// caller passing `is_background_task: true`), but an ordinary live
+/// conversational turn almost never touches a browser -- gating this out
+/// for plain conversation is the single largest lever on per-turn token
+/// cost, which is what actually determines how long Groq's per-minute
+/// quota lasts across a session, not how many keys are configured.
+fn needs_browser_tools(transcript: &str, is_background_task: bool) -> bool {
+    if is_background_task {
+        return true;
+    }
+    let text = transcript.to_ascii_lowercase();
+    [
+        "browse",
+        "website",
+        "web page",
+        "webpage",
+        "http://",
+        "https://",
+        "search the web",
+        "navigate to",
+        "click on the",
+        "screenshot the page",
+        ".com",
+        ".org",
+        ".dev",
+        ".io",
+    ]
+    .iter()
+    .any(|phrase| text.contains(phrase))
 }
 
 fn next_tts_boundary(text: &str, start: usize) -> Option<usize> {
@@ -66,13 +112,79 @@ fn next_tts_boundary(text: &str, start: usize) -> Option<usize> {
     None
 }
 
+/// Explicit "do this later" phrasing, for anyone who wants to name the
+/// mechanism directly rather than just asking a research-shaped question.
+const EXPLICIT_BACKGROUND_PREFIXES: &[&str] = &[
+    "run this in the background: ",
+    "work on this in the background: ",
+    "keep working on: ",
+];
+
+/// Natural research phrasing that should become a background task without
+/// the user ever needing to say "in the background" -- "research X",
+/// "look into X", "can you look up X" should all just work.
+const RESEARCH_PREFIXES: &[&str] = &[
+    "research ",
+    "research into ",
+    "do some research on ",
+    "do some research into ",
+    "look into ",
+    "can you look into ",
+    "could you look into ",
+    "look up ",
+    "can you look up ",
+    "could you look up ",
+    "find out about ",
+    "can you find out about ",
+    "dig into ",
+    "investigate ",
+    "can you investigate ",
+];
+
 fn background_request(text: &str) -> Option<&str> {
     let text = text.trim();
-    ["run this in the background: ", "work on this in the background: ", "keep working on: "]
-        .iter().find_map(|prefix| text.strip_prefix(prefix)).filter(|rest| !rest.trim().is_empty())
+    EXPLICIT_BACKGROUND_PREFIXES
+        .iter()
+        .find_map(|prefix| text.strip_prefix(prefix))
+        .or_else(|| {
+            let lower = text.to_ascii_lowercase();
+            RESEARCH_PREFIXES.iter().find_map(|prefix| {
+                lower
+                    .starts_with(prefix)
+                    .then(|| text[prefix.len()..].trim_start())
+            })
+        })
+        .filter(|rest| !rest.trim().is_empty())
 }
 
-async fn start_background_task(request: &str, app: &AppHandle, current_gen_id: usize) -> Option<String> {
+/// Background jobs (research, multi-step digging) default to the local
+/// Ollama VM so a long-running job never competes with the live
+/// conversation for Groq's per-minute token budget. Overridable in case
+/// the local model isn't reliable enough for a particular job's tool use.
+fn background_llm_provider() -> String {
+    std::env::var("KAREN_BACKGROUND_LLM_PROVIDER").unwrap_or_else(|_| "ollama".into())
+}
+
+/// A short, in-character line read out loud the moment research actually
+/// finishes -- not the findings themselves (those can be long and the user
+/// may be mid-conversation about something else), just an invitation to
+/// come back to it when ready, the way a colleague would say "I've got
+/// that for you whenever."
+fn research_ready_announcement(topic: &str, ok: bool) -> String {
+    if ok {
+        format!("I've got what I found on {topic} whenever you want to hear it.")
+    } else {
+        format!(
+            "I hit a wall researching {topic}. Ask me about it and I'll tell you what went wrong."
+        )
+    }
+}
+
+async fn start_background_task(
+    request: &str,
+    app: &AppHandle,
+    _current_gen_id: usize,
+) -> Option<String> {
     let memory = app.state::<crate::memory::MemoryEngine>();
     let task_id = {
         let db = memory.db.lock().await;
@@ -81,22 +193,51 @@ async fn start_background_task(request: &str, app: &AppHandle, current_gen_id: u
     let task_for_worker = task_id.clone();
     let worker_app = app.clone();
     let worker_request = request.to_string();
-    std::thread::spawn(move || tauri::async_runtime::block_on(async move {
-        {
+    let provider = background_llm_provider();
+    let _ = app.emit(
+        "karen-task",
+        json!({"task_id": task_id, "status": "queued", "description": request}),
+    );
+    std::thread::spawn(move || {
+        tauri::async_runtime::block_on(async move {
+            {
+                let memory = worker_app.state::<crate::memory::MemoryEngine>();
+                let db = memory.db.lock().await;
+                let _ = db.update_task(&task_for_worker, "running", None);
+            }
+            let _ = worker_app.emit("karen-task", json!({"task_id": task_for_worker, "status": "running", "description": worker_request}));
+
+            // Background work never speaks through the live turn's generation --
+            // by the time a research job finishes, the user has likely moved on
+            // to other turns entirely, so this must interrupt with whatever
+            // generation is current *now*, not the one captured at kickoff.
+            let announce_gen_id = crate::tts::get_current_generation();
+            let result = run_agentic_inner(
+                &worker_request,
+                &worker_app,
+                None,
+                announce_gen_id,
+                Some(&provider),
+            )
+            .await;
+            let (status, output, ok) = match result {
+                Ok(answer) => ("completed", answer, true),
+                Err(error) => ("failed", error.clone(), false),
+            };
             let memory = worker_app.state::<crate::memory::MemoryEngine>();
             let db = memory.db.lock().await;
-            let _ = db.update_task(&task_for_worker, "running", None);
-        }
-        let result = run_agentic(&worker_request, &worker_app, None, current_gen_id).await;
-        let (status, output) = match result {
-            Ok(answer) => ("completed", answer),
-            Err(error) => ("failed", error),
-        };
-        let memory = worker_app.state::<crate::memory::MemoryEngine>();
-        let db = memory.db.lock().await;
-        let _ = db.update_task(&task_for_worker, status, Some(&output));
-        let _ = worker_app.emit("karen-task", json!({"task_id": task_for_worker, "status": status, "result": output}));
-    }));
+            let _ = db.update_task(&task_for_worker, status, Some(&output));
+            drop(db);
+
+            let announce_gen_id = crate::tts::get_current_generation();
+            speak_now(
+                research_ready_announcement(&worker_request, ok),
+                None,
+                announce_gen_id,
+            );
+            let _ = worker_app.emit("karen-task", json!({"task_id": task_for_worker, "status": status, "description": worker_request, "result": output}));
+        })
+    });
     Some(task_id)
 }
 const MAX_ITERS: usize = 5;
@@ -274,23 +415,97 @@ fn emit_running_tool(app: &AppHandle, name: &str, gen_id: usize) {
     }
 }
 
+/// The system prompt tells the model not to use markdown, but that's a
+/// request, not a guarantee -- a model will still occasionally slip in
+/// `**bold**`, `- bullet` lines, or a `#` heading. TTS speaks whatever
+/// string it's given literally, so an unstripped `**` reads out loud as
+/// "star star", which is exactly the "sounds robotic" complaint this
+/// fixes. Applied right before every call to `speak_chunk` so no path can
+/// forget it.
+fn strip_markdown_for_speech(text: &str) -> String {
+    // Turn list-style line breaks into spoken pauses before stripping
+    // bullet markers, so "- First\n- Second" reads as "First. Second."
+    // instead of running the words together with no pause at all.
+    let mut normalized = String::with_capacity(text.len());
+    for line in text.replace("\r\n", "\n").split('\n') {
+        let trimmed = line.trim_start();
+        let without_bullet = trimmed
+            .strip_prefix("- ")
+            .or_else(|| trimmed.strip_prefix("* "))
+            .or_else(|| trimmed.strip_prefix("• "))
+            .unwrap_or(trimmed);
+        if !normalized.is_empty() && !without_bullet.is_empty() {
+            normalized.push_str(". ");
+        }
+        normalized.push_str(without_bullet);
+    }
+
+    // Drop emphasis/heading/code markers outright -- nobody says "asterisk
+    // asterisk" or "hash" out loud, so there is no spoken equivalent to
+    // preserve; the enclosed words carry the meaning on their own.
+    let stripped: String = normalized
+        .chars()
+        .filter(|c| !matches!(c, '*' | '_' | '#' | '`'))
+        .collect();
+
+    stripped
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .replace(" .", ".")
+}
+
 /// Every fast, non-streamed reply path (deterministic routing, canned
 /// greetings, background-task acknowledgements) must still reach TTS the
 /// same way a streamed LLM answer does -- otherwise the HUD shows text with
 /// no audio, which looks identical to Friday being broken.
 fn speak_now(text: String, speech_ended_at: Option<std::time::Instant>, gen_id: usize) -> String {
-    let utterance_id = format!("u-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis());
-    crate::tts::speak_chunk(text.clone(), speech_ended_at, utterance_id, 0, gen_id);
+    let utterance_id = format!(
+        "u-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis()
+    );
+    crate::tts::speak_chunk(
+        strip_markdown_for_speech(&text),
+        speech_ended_at,
+        utterance_id,
+        0,
+        gen_id,
+    );
     text
 }
 
-pub async fn run_agentic(transcript: &str, app: &AppHandle, speech_ended_at: Option<std::time::Instant>, current_gen_id: usize) -> Result<String, String> {
+pub async fn run_agentic(
+    transcript: &str,
+    app: &AppHandle,
+    speech_ended_at: Option<std::time::Instant>,
+    current_gen_id: usize,
+) -> Result<String, String> {
+    run_agentic_inner(transcript, app, speech_ended_at, current_gen_id, None).await
+}
+
+/// `forced_provider` lets a caller pin this one call to a specific LLM
+/// provider ("groq"/"ollama") regardless of the process-wide
+/// `KAREN_LLM_PROVIDER` setting. Used by background research tasks so a
+/// long-running job doesn't contend with the live conversation's Groq
+/// token budget -- the setting is process-wide and mutable (see
+/// ARCHITECTURE.md's known limitations), so overriding it for the live
+/// turn would also wrongly affect the background job and vice versa.
+pub async fn run_agentic_inner(
+    transcript: &str,
+    app: &AppHandle,
+    speech_ended_at: Option<std::time::Instant>,
+    current_gen_id: usize,
+    forced_provider: Option<&str>,
+) -> Result<String, String> {
     if let Some(reply) = router::fast_reply(transcript) {
         return Ok(speak_now(reply, speech_ended_at, current_gen_id));
     }
     if let Some(request) = background_request(transcript) {
-        if let Some(task_id) = start_background_task(request, app, current_gen_id).await {
-            let reply = format!("I’ve queued that as task {task_id}. Ask me for its status when you’re ready.");
+        if let Some(_task_id) = start_background_task(request, app, current_gen_id).await {
+            let reply = format!("On it — I'll dig into {request} in the background and let you know when I've got something.");
             return Ok(speak_now(reply, speech_ended_at, current_gen_id));
         }
         return Err("I couldn’t create a background task record.".into());
@@ -309,12 +524,15 @@ pub async fn run_agentic(transcript: &str, app: &AppHandle, speech_ended_at: Opt
                 return Ok(speak_now(reply, speech_ended_at, current_gen_id));
             }
             router::Route::SetVolume(percent) => {
-                let result = tools::dispatch("set_volume", &json!({"percent": percent}).to_string(), app).await;
+                let result =
+                    tools::dispatch("set_volume", &json!({"percent": percent}).to_string(), app)
+                        .await;
                 let reply = format_routed_result("Volume", result);
                 return Ok(speak_now(reply, speech_ended_at, current_gen_id));
             }
             router::Route::OpenApp(name) => {
-                let result = tools::dispatch("open_app", &json!({"name": name}).to_string(), app).await;
+                let result =
+                    tools::dispatch("open_app", &json!({"name": name}).to_string(), app).await;
                 let reply = format_routed_result("Application", result);
                 return Ok(speak_now(reply, speech_ended_at, current_gen_id));
             }
@@ -323,8 +541,14 @@ pub async fn run_agentic(transcript: &str, app: &AppHandle, speech_ended_at: Opt
 
     let budget = std::time::Duration::from_millis(latency_budget_ms());
     let deadline = std::time::Instant::now() + budget;
-    let provider = std::env::var("KAREN_LLM_PROVIDER").unwrap_or_else(|_| "groq".into());
-    let use_ollama = provider.eq_ignore_ascii_case("ollama");
+    let configured_provider = forced_provider
+        .map(|p| p.to_string())
+        .unwrap_or_else(|| std::env::var("KAREN_LLM_PROVIDER").unwrap_or_else(|_| "groq".into()));
+    let use_ollama = configured_provider.eq_ignore_ascii_case("ollama")
+        || (forced_provider.is_none() && crate::groq_keys::cooldown_remaining().is_some());
+    if use_ollama && configured_provider.eq_ignore_ascii_case("groq") {
+        log::warn!("Groq is in a shared rate-limit cooldown; using Ollama for this turn");
+    }
     let groq_keys = if use_ollama {
         Vec::new()
     } else {
@@ -353,7 +577,9 @@ pub async fn run_agentic(transcript: &str, app: &AppHandle, speech_ended_at: Opt
     let context_engine = app.state::<crate::context_engine::ContextEngine>();
     let ctx = context_engine.get_context();
     let query_embedding = if use_ollama && needs_semantic_memory(transcript) {
-        crate::memory::semantic::ollama_embedding(transcript).await.ok()
+        crate::memory::semantic::ollama_embedding(transcript)
+            .await
+            .ok()
     } else {
         None
     };
@@ -363,7 +589,8 @@ pub async fn run_agentic(transcript: &str, app: &AppHandle, speech_ended_at: Opt
 
         let mut relevant_memories = String::new();
         let memories = if let Some(ref embedding) = query_embedding {
-            db.search_semantic_memories(embedding, 5).or_else(|_| db.search_memories(transcript))
+            db.search_semantic_memories(embedding, 5)
+                .or_else(|_| db.search_memories(transcript))
         } else {
             db.search_memories(transcript)
         };
@@ -383,7 +610,10 @@ pub async fn run_agentic(transcript: &str, app: &AppHandle, speech_ended_at: Opt
                 recent_events.push_str("\n\nRecent activity timeline:\n");
                 for e in events {
                     let time_str = crate::memory::temporal::format_relative_time(&e.recorded_at);
-                    recent_events.push_str(&format!("- [{time_str}] ({}): {}\n", e.event_type, e.description));
+                    recent_events.push_str(&format!(
+                        "- [{time_str}] ({}): {}\n",
+                        e.event_type, e.description
+                    ));
                 }
             }
         }
@@ -391,10 +621,12 @@ pub async fn run_agentic(transcript: &str, app: &AppHandle, speech_ended_at: Opt
         (relevant_memories, recent_events)
     };
 
-    let ctx_str = format!("Current inferred activity: {}. Top active processes: {:?}{}{}", ctx.activity_inference, ctx.current_processes, relevant_memories, recent_events);
+    let ctx_str = format!(
+        "Current inferred activity: {}. Top active processes: {:?}{}{}",
+        ctx.activity_inference, ctx.current_processes, relevant_memories, recent_events
+    );
 
-    let mut messages = vec![
-        Message::system(format!(
+    let mut messages = vec![Message::system(format!(
             "{persona}\n\n---\n\
              Operational context: today's date is {today}. {ctx_str}\n\
              You have tools available to launch \
@@ -403,26 +635,31 @@ pub async fn run_agentic(transcript: &str, app: &AppHandle, speech_ended_at: Opt
              the request calls for it. Only answer directly with plain text once you have \
              everything you need. Despite the persona above, keep answers concise -- they may \
              be read aloud via text-to-speech or shown in a small status pill; save depth for \
-             when elaboration is specifically asked for. Proactive mode is {proactive_mode}; \
+             when elaboration is specifically asked for. Every reply is spoken aloud, never read \
+             as text, so never use markdown, bullet points, numbered lists, or headers -- no \
+             asterisks, dashes-as-bullets, or hash symbols. Say lists as a spoken sentence \
+             (\"first, ... then, ... finally, ...\") instead. Proactive mode is {proactive_mode}; \
              when it is enabled, offer one relevant next step or useful observation after \
              completing the request, but never invent activity or interrupt without a clear reason."
-        )),
-    ];
+        ))];
 
     let conv_id = {
         let memory = app.state::<crate::memory::MemoryEngine>();
         let db = memory.db.lock().await;
-        
+
         let id = match db.get_active_conversation().unwrap_or(None) {
             Some(id) => id,
-            None => db.create_conversation().unwrap_or_else(|_| "default-conv".to_string()),
+            None => db
+                .create_conversation()
+                .unwrap_or_else(|_| "default-conv".to_string()),
         };
 
         if let Ok(recent) = db.get_recent_messages(&id, context_message_limit()) {
             for msg in recent {
                 let time_str = crate::memory::temporal::format_relative_time(&msg.recorded_at);
                 if msg.role == "user" {
-                    let content_with_time = format!("[{time_str}]: {}", compact_context_message(&msg.content));
+                    let content_with_time =
+                        format!("[{time_str}]: {}", compact_context_message(&msg.content));
                     messages.push(Message::user(content_with_time));
                 } else if msg.role == "assistant" {
                     messages.push(Message::assistant(compact_context_message(&msg.content)));
@@ -436,13 +673,27 @@ pub async fn run_agentic(transcript: &str, app: &AppHandle, speech_ended_at: Opt
 
     messages.push(Message::user(transcript.to_string()));
 
-    let tools = tools::all_tool_defs();
+    let include_mcp = needs_browser_tools(transcript, forced_provider.is_some());
+    let tools = tools::all_tool_defs_with(include_mcp);
+    log::info!(
+        "tool definitions: {} tools ({}), {} bytes serialized",
+        tools.len(),
+        if include_mcp {
+            "incl. browser tools"
+        } else {
+            "browser tools excluded"
+        },
+        serde_json::to_vec(&tools).map(|v| v.len()).unwrap_or(0)
+    );
     let client = http_client()?;
 
     for _ in 0..MAX_ITERS {
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         if remaining.is_zero() {
-            return Err(format!("request exceeded its {}ms latency budget", budget.as_millis()));
+            return Err(format!(
+                "request exceeded its {}ms latency budget",
+                budget.as_millis()
+            ));
         }
         let request = ChatRequest {
             model: &model,
@@ -455,8 +706,13 @@ pub async fn run_agentic(transcript: &str, app: &AppHandle, speech_ended_at: Opt
             temperature: 0.2,
         };
 
-        let body = serde_json::to_vec(&request).map_err(|e| format!("failed to encode request: {e}"))?;
-        log::debug!("{} request body: {} bytes", if use_ollama { "Ollama" } else { "Groq" }, body.len());
+        let body =
+            serde_json::to_vec(&request).map_err(|e| format!("failed to encode request: {e}"))?;
+        log::debug!(
+            "{} request body: {} bytes",
+            if use_ollama { "Ollama" } else { "Groq" },
+            body.len()
+        );
 
         // Groq keys rotate round-robin with failover on 401/403/429; Ollama
         // needs no key and always makes a single attempt.
@@ -476,10 +732,24 @@ pub async fn run_agentic(transcript: &str, app: &AppHandle, speech_ended_at: Opt
             }
             let attempt = tokio::time::timeout(remaining, request_builder.send())
                 .await
-                .map_err(|_| format!("request exceeded its {}ms latency budget", budget.as_millis()))?
+                .map_err(|_| {
+                    format!(
+                        "request exceeded its {}ms latency budget",
+                        budget.as_millis()
+                    )
+                })?
                 .map_err(|e| format!("LLM request failed: {e}"))?;
 
             let status = attempt.status();
+            if !use_ollama {
+                if let Some(key) = key {
+                    crate::groq_keys::record_rate_limit_response(
+                        key,
+                        status.as_u16(),
+                        attempt.headers(),
+                    );
+                }
+            }
             if status.is_success() {
                 response = Some(attempt);
                 break;
@@ -509,15 +779,27 @@ pub async fn run_agentic(transcript: &str, app: &AppHandle, speech_ended_at: Opt
         let mut last_spoken_idx = 0;
         let mut seq_num = 0;
         let mut acknowledgement_spoken = false;
-        let utterance_id = format!("u-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis());
+        let utterance_id = format!(
+            "u-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+        );
 
         while let Some(chunk) = tokio::time::timeout(
             deadline.saturating_duration_since(std::time::Instant::now()),
             response.chunk(),
         )
         .await
-        .map_err(|_| format!("request exceeded its {}ms latency budget", budget.as_millis()))?
-        .map_err(|e| format!("stream error: {e}"))? {
+        .map_err(|_| {
+            format!(
+                "request exceeded its {}ms latency budget",
+                budget.as_millis()
+            )
+        })?
+        .map_err(|e| format!("stream error: {e}"))?
+        {
             // Check if cancelled
             if current_gen_id != crate::tts::get_current_generation() {
                 log::info!("LLM generation cancelled by user interruption.");
@@ -528,7 +810,7 @@ pub async fn run_agentic(transcript: &str, app: &AppHandle, speech_ended_at: Opt
 
             while let Some(idx) = buffer.find("\n\n") {
                 let event_str = buffer[..idx].to_string();
-                buffer = buffer[idx+2..].to_string();
+                buffer = buffer[idx + 2..].to_string();
 
                 for line in event_str.lines() {
                     if let Some(data) = line.strip_prefix("data: ") {
@@ -540,7 +822,10 @@ pub async fn run_agentic(transcript: &str, app: &AppHandle, speech_ended_at: Opt
                                 if let Some(ref text) = choice.delta.content {
                                     if first_token {
                                         if let Some(start) = speech_ended_at {
-                                            log::info!("LLM First Token received (TTFT): {:?}", std::time::Instant::now().duration_since(start));
+                                            log::info!(
+                                                "LLM First Token received (TTFT): {:?}",
+                                                std::time::Instant::now().duration_since(start)
+                                            );
                                         } else {
                                             log::info!("LLM First Token received.");
                                         }
@@ -550,12 +835,27 @@ pub async fn run_agentic(transcript: &str, app: &AppHandle, speech_ended_at: Opt
                                     if current_gen_id == crate::tts::get_current_generation() {
                                         let _ = app.emit("karen-pipeline", json!({ "stage": "answer", "detail": accumulated_content }));
                                     }
-                                    
-                                    while let Some(end_idx) = next_tts_boundary(&accumulated_content, last_spoken_idx) {
-                                        let sentence = accumulated_content[last_spoken_idx..end_idx].trim().to_string();
-                                        
+
+                                    while let Some(end_idx) =
+                                        next_tts_boundary(&accumulated_content, last_spoken_idx)
+                                    {
+                                        let sentence = accumulated_content
+                                            [last_spoken_idx..end_idx]
+                                            .trim()
+                                            .to_string();
+
                                         if sentence.chars().any(|c| c.is_alphanumeric()) {
-                                            crate::tts::speak_chunk(sentence, if last_spoken_idx == 0 { speech_ended_at } else { None }, utterance_id.clone(), seq_num, current_gen_id);
+                                            crate::tts::speak_chunk(
+                                                strip_markdown_for_speech(&sentence),
+                                                if last_spoken_idx == 0 {
+                                                    speech_ended_at
+                                                } else {
+                                                    None
+                                                },
+                                                utterance_id.clone(),
+                                                seq_num,
+                                                current_gen_id,
+                                            );
                                             seq_num += 1;
                                         }
                                         last_spoken_idx = end_idx;
@@ -567,11 +867,16 @@ pub async fn run_agentic(transcript: &str, app: &AppHandle, speech_ended_at: Opt
                                             accumulated_tool_calls.push(ToolCall {
                                                 id: String::new(),
                                                 kind: "function".to_string(),
-                                                function: ToolCallFn { name: String::new(), arguments: String::new() },
+                                                function: ToolCallFn {
+                                                    name: String::new(),
+                                                    arguments: String::new(),
+                                                },
                                             });
                                         }
                                         let active_tc = &mut accumulated_tool_calls[tc.index];
-                                        if let Some(ref id) = tc.id { active_tc.id.push_str(id); }
+                                        if let Some(ref id) = tc.id {
+                                            active_tc.id.push_str(id);
+                                        }
                                         // Unlike `name`/`arguments`, which genuinely arrive as
                                         // string fragments to be concatenated, `type` is always
                                         // sent as a complete value ("function") -- some providers
@@ -581,10 +886,16 @@ pub async fn run_agentic(transcript: &str, app: &AppHandle, speech_ended_at: Opt
                                         // Groq's strict enum validation on `tool_calls[].type`
                                         // rejected with a 400 on the next request that replayed
                                         // this message as history. Assign, don't accumulate.
-                                        if let Some(ref kind) = tc.kind { active_tc.kind = kind.clone(); }
+                                        if let Some(ref kind) = tc.kind {
+                                            active_tc.kind = kind.clone();
+                                        }
                                         if let Some(ref f) = tc.function {
-                                            if let Some(ref n) = f.name { active_tc.function.name.push_str(n); }
-                                            if let Some(ref a) = f.arguments { active_tc.function.arguments.push_str(a); }
+                                            if let Some(ref n) = f.name {
+                                                active_tc.function.name.push_str(n);
+                                            }
+                                            if let Some(ref a) = f.arguments {
+                                                active_tc.function.arguments.push_str(a);
+                                            }
                                         }
                                     }
                                 }
@@ -597,8 +908,16 @@ pub async fn run_agentic(transcript: &str, app: &AppHandle, speech_ended_at: Opt
 
         let message = Message {
             role: "assistant".to_string(),
-            content: if accumulated_content.is_empty() { None } else { Some(accumulated_content.clone()) },
-            tool_calls: if accumulated_tool_calls.is_empty() { None } else { Some(accumulated_tool_calls.clone()) },
+            content: if accumulated_content.is_empty() {
+                None
+            } else {
+                Some(accumulated_content.clone())
+            },
+            tool_calls: if accumulated_tool_calls.is_empty() {
+                None
+            } else {
+                Some(accumulated_tool_calls.clone())
+            },
             tool_call_id: None,
             name: None,
         };
@@ -606,7 +925,17 @@ pub async fn run_agentic(transcript: &str, app: &AppHandle, speech_ended_at: Opt
         if last_spoken_idx < accumulated_content.len() {
             let remainder = accumulated_content[last_spoken_idx..].trim().to_string();
             if remainder.chars().any(|c| c.is_alphanumeric()) {
-                crate::tts::speak_chunk(remainder, if last_spoken_idx == 0 { speech_ended_at } else { None }, utterance_id.clone(), seq_num, current_gen_id);
+                crate::tts::speak_chunk(
+                    strip_markdown_for_speech(&remainder),
+                    if last_spoken_idx == 0 {
+                        speech_ended_at
+                    } else {
+                        None
+                    },
+                    utterance_id.clone(),
+                    seq_num,
+                    current_gen_id,
+                );
             }
         }
 
@@ -625,7 +954,10 @@ pub async fn run_agentic(transcript: &str, app: &AppHandle, speech_ended_at: Opt
 
         for call in tool_calls {
             if !tool_call_allowed(transcript, &call.function.name) {
-                log::warn!("blocked tool call without explicit user intent: {}", call.function.name);
+                log::warn!(
+                    "blocked tool call without explicit user intent: {}",
+                    call.function.name
+                );
                 messages.push(Message::tool_result(call.id, call.function.name.clone(), json!({"ok": false, "error": "tool call blocked because the original request did not explicitly ask for this action"})));
                 continue;
             }
@@ -642,7 +974,11 @@ pub async fn run_agentic(transcript: &str, app: &AppHandle, speech_ended_at: Opt
                 acknowledgement_spoken = true;
             }
             let result = tools::dispatch(&call.function.name, &call.function.arguments, app).await;
-            messages.push(Message::tool_result(call.id, call.function.name.clone(), result));
+            messages.push(Message::tool_result(
+                call.id,
+                call.function.name.clone(),
+                result,
+            ));
         }
     }
 
@@ -650,24 +986,47 @@ pub async fn run_agentic(transcript: &str, app: &AppHandle, speech_ended_at: Opt
 }
 
 fn format_routed_result(label: &str, result: Value) -> String {
-    if result.get("confirmation_required").and_then(Value::as_bool).unwrap_or(false) {
-        return result.get("message").and_then(Value::as_str).unwrap_or("Confirmation required.").to_string();
+    if result
+        .get("confirmation_required")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return result
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("Confirmation required.")
+            .to_string();
     }
     if result.get("ok").and_then(Value::as_bool) == Some(true) {
         match label {
-            "Volume" => format!("Volume set to {} percent.", result.get("percent").and_then(Value::as_i64).unwrap_or(0)),
-            "Application" => format!("Opened {}.", result.get("opened").and_then(Value::as_str).unwrap_or("the application")),
+            "Volume" => format!(
+                "Volume set to {} percent.",
+                result.get("percent").and_then(Value::as_i64).unwrap_or(0)
+            ),
+            "Application" => format!(
+                "Opened {}.",
+                result
+                    .get("opened")
+                    .and_then(Value::as_str)
+                    .unwrap_or("the application")
+            ),
             _ => format!("{label} checked."),
         }
     } else {
-        result.get("error").and_then(Value::as_str).map(|e| format!("{label} failed: {e}")).unwrap_or_else(|| format!("{label} failed."))
+        result
+            .get("error")
+            .and_then(Value::as_str)
+            .map(|e| format!("{label} failed: {e}"))
+            .unwrap_or_else(|| format!("{label} failed."))
     }
 }
 
 fn tool_acknowledgement(name: &str) -> &'static str {
     match name {
         "open_app" | "open_url" => "Opening that now.",
-        "read_file" | "list_directory" | "list_dev_logs" | "read_dev_logs" => "I’m checking that now.",
+        "read_file" | "list_directory" | "list_dev_logs" | "read_dev_logs" => {
+            "I’m checking that now."
+        }
         "screen_ocr" | "take_screenshot" => "I’m looking at the screen now.",
         "list_processes" | "get_system_info" => "I’m checking the system now.",
         "save_memory" => "I’ll remember that.",
@@ -676,36 +1035,63 @@ fn tool_acknowledgement(name: &str) -> &'static str {
 }
 
 fn tool_call_allowed(original_request: &str, name: &str) -> bool {
-    if matches!(name, "read_file" | "list_directory" | "get_system_info" | "list_processes" | "get_current_time" | "search_events" | "list_tasks" | "get_task" | "screen_ocr" | "take_screenshot") { return true; }
+    if matches!(
+        name,
+        "read_file"
+            | "list_directory"
+            | "get_system_info"
+            | "list_processes"
+            | "get_current_time"
+            | "search_events"
+            | "list_tasks"
+            | "get_task"
+            | "screen_ocr"
+            | "take_screenshot"
+    ) {
+        return true;
+    }
     let text = original_request.to_ascii_lowercase();
     // Namespaced MCP tools (browser operate/read/research): allowed when the
     // request is observably a look-something-up errand.
     if name.starts_with("mcp__") {
-        return ["research", "search", "look up", "lookup", "browse", "open",
-            "visit", "go to", "check", "read", "find", "compare", "look at",
-            "what is", "what are", "what was", "how to"]
-            .iter()
-            .any(|v| text.contains(v));
+        return [
+            "research", "search", "look up", "lookup", "browse", "open", "visit", "go to", "check",
+            "read", "find", "compare", "look at", "what is", "what are", "what was", "how to",
+        ]
+        .iter()
+        .any(|v| text.contains(v));
     }
     match name {
         "open_app" => ["open", "launch", "start"].iter().any(|v| text.contains(v)),
         "open_url" => text.contains("open") || text.contains("visit") || text.contains("go to"),
         "set_volume" => text.contains("volume") || text.contains("sound") || text.contains("mute"),
-        "press_key" | "type_text" => text.contains("type") || text.contains("press") || text.contains("write"),
-        "save_memory" => text.contains("remember") || text.contains("save this") || text.contains("note that"),
-        "create_task" => text.contains("task") || text.contains("background") || text.contains("work on"),
+        "press_key" | "type_text" => {
+            text.contains("type") || text.contains("press") || text.contains("write")
+        }
+        "save_memory" => {
+            text.contains("remember") || text.contains("save this") || text.contains("note that")
+        }
+        "create_task" => {
+            text.contains("task") || text.contains("background") || text.contains("work on")
+        }
         _ => false,
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{background_request, needs_semantic_memory, tool_acknowledgement, tool_call_allowed};
+    use super::{
+        background_request, needs_browser_tools, needs_semantic_memory,
+        research_ready_announcement, strip_markdown_for_speech, tool_acknowledgement,
+        tool_call_allowed,
+    };
 
     #[test]
     fn semantic_lookup_is_reserved_for_memory_questions() {
         assert!(needs_semantic_memory("What did we work on yesterday?"));
-        assert!(needs_semantic_memory("remember that my VM is on the lab network"));
+        assert!(needs_semantic_memory(
+            "remember that my VM is on the lab network"
+        ));
         assert!(!needs_semantic_memory("open the browser"));
         assert!(!needs_semantic_memory("set the volume to 40"));
     }
@@ -720,13 +1106,97 @@ mod tests {
     fn blocks_implicit_mutations_but_allows_explicit_actions() {
         assert!(!tool_call_allowed("tell me about my system", "type_text"));
         assert!(tool_call_allowed("open VS Code", "open_app"));
-        assert!(tool_call_allowed("what is my system status", "get_system_info"));
+        assert!(tool_call_allowed(
+            "what is my system status",
+            "get_system_info"
+        ));
     }
 
     #[test]
     fn recognizes_explicit_background_requests_only() {
-        assert_eq!(background_request("run this in the background: inspect the logs"), Some("inspect the logs"));
+        assert_eq!(
+            background_request("run this in the background: inspect the logs"),
+            Some("inspect the logs")
+        );
         assert_eq!(background_request("inspect the logs"), None);
     }
 
+    #[test]
+    fn recognizes_natural_research_phrasing_without_needing_background_wording() {
+        assert_eq!(
+            background_request("Research clean architecture in SDLC"),
+            Some("clean architecture in SDLC")
+        );
+        assert_eq!(
+            background_request("can you look into the new Rust async traits feature"),
+            Some("the new Rust async traits feature")
+        );
+        assert_eq!(
+            background_request("look up the latest whisper.cpp release notes"),
+            Some("the latest whisper.cpp release notes")
+        );
+        assert_eq!(
+            background_request("investigate why the build is slow"),
+            Some("why the build is slow")
+        );
+    }
+
+    #[test]
+    fn leaves_ordinary_conversation_alone() {
+        assert_eq!(background_request("what's the weather like"), None);
+        assert_eq!(background_request("open the browser"), None);
+    }
+
+    #[test]
+    fn research_announcement_is_short_and_in_character_for_both_outcomes() {
+        let ok = research_ready_announcement("clean architecture", true);
+        let failed = research_ready_announcement("clean architecture", false);
+        assert!(ok.contains("clean architecture"));
+        assert!(failed.contains("clean architecture"));
+        assert_ne!(ok, failed);
+    }
+
+    #[test]
+    fn strips_markdown_emphasis_and_headings_so_tts_never_speaks_symbols() {
+        assert_eq!(
+            strip_markdown_for_speech("**Multi-cloud** workloads"),
+            "Multi-cloud workloads"
+        );
+        assert_eq!(strip_markdown_for_speech("# Heading"), "Heading");
+        assert_eq!(
+            strip_markdown_for_speech("use `cargo test`"),
+            "use cargo test"
+        );
+        assert_eq!(strip_markdown_for_speech("_italic_ text"), "italic text");
+    }
+
+    #[test]
+    fn turns_bullet_lines_into_spoken_pauses_not_run_together_words() {
+        let spoken = strip_markdown_for_speech("- First point\n- Second point");
+        assert_eq!(spoken, "First point. Second point");
+    }
+
+    #[test]
+    fn leaves_ordinary_hyphenated_words_alone() {
+        assert_eq!(
+            strip_markdown_for_speech("zero-trust networking"),
+            "zero-trust networking"
+        );
+    }
+
+    #[test]
+    fn background_tasks_always_get_browser_tools() {
+        assert!(needs_browser_tools("what's the weather", true));
+    }
+
+    #[test]
+    fn ordinary_conversation_excludes_browser_tools_unless_it_names_the_web() {
+        assert!(!needs_browser_tools("what time is it", false));
+        assert!(!needs_browser_tools("set the volume to 50", false));
+        assert!(needs_browser_tools(
+            "go to github.com and check the issues",
+            false
+        ));
+        assert!(needs_browser_tools("can you browse to that website", false));
+    }
 }

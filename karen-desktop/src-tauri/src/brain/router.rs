@@ -18,10 +18,7 @@ const GREETINGS: &[&str] = &[
     "Hey. Go ahead.",
     "Hello. What do you need?",
 ];
-const STATUS_CHECKS: &[&str] = &[
-    "Still here, still listening.",
-    "Right here. Go ahead.",
-];
+const STATUS_CHECKS: &[&str] = &["Still here, still listening.", "Right here. Go ahead."];
 const IDENTITY: &[&str] = &["I'm Friday, your local desktop assistant."];
 
 static GREETING_IDX: AtomicUsize = AtomicUsize::new(0);
@@ -46,8 +43,8 @@ pub fn fast_reply(input: &str) -> Option<String> {
         | "hello there" | "good morning" | "good afternoon" | "good evening" => {
             Some(pick(GREETINGS, &GREETING_IDX))
         }
-        "are you there" | "you there" | "are you listening" | "you listening"
-        | "are you awake" | "can you hear me" => Some(pick(STATUS_CHECKS, &STATUS_IDX)),
+        "are you there" | "you there" | "are you listening" | "you listening" | "are you awake"
+        | "can you hear me" => Some(pick(STATUS_CHECKS, &STATUS_IDX)),
         "who are you" | "what are you" | "what's your name" | "whats your name" => {
             Some(IDENTITY[0].to_string())
         }
@@ -57,23 +54,56 @@ pub fn fast_reply(input: &str) -> Option<String> {
 
 pub fn route(input: &str) -> Option<Route> {
     let text = input.trim().to_ascii_lowercase();
-    if text.is_empty() { return None; }
+    if text.is_empty() {
+        return None;
+    }
 
-    if matches!(text.as_str(), "stop" | "cancel" | "stop talking" | "stop playback" | "stop the music" | "be quiet" | "never mind" | "nevermind") {
+    if matches!(
+        text.as_str(),
+        "stop"
+            | "cancel"
+            | "stop talking"
+            | "stop playback"
+            | "stop the music"
+            | "be quiet"
+            | "never mind"
+            | "nevermind"
+    ) {
         return Some(Route::StopPlayback);
     }
-    if matches!(text.as_str(), "system status" | "system info" | "system information" | "computer status" | "what is my system status") {
+    if matches!(
+        text.as_str(),
+        "system status"
+            | "system info"
+            | "system information"
+            | "computer status"
+            | "what is my system status"
+    ) {
         return Some(Route::SystemInfo);
     }
 
-    for prefix in ["set volume to ", "set the volume to ", "volume to ", "turn volume to "] {
-        if let Some(value) = text.strip_prefix(prefix).and_then(|v| v.strip_suffix('%').unwrap_or(v).trim().parse::<i64>().ok()) {
-            if (0..=100).contains(&value) { return Some(Route::SetVolume(value)); }
+    for prefix in [
+        "set volume to ",
+        "set the volume to ",
+        "volume to ",
+        "turn volume to ",
+    ] {
+        if let Some(value) = text
+            .strip_prefix(prefix)
+            .and_then(|v| v.strip_suffix('%').unwrap_or(v).trim().parse::<i64>().ok())
+        {
+            if (0..=100).contains(&value) {
+                return Some(Route::SetVolume(value));
+            }
         }
     }
 
     for prefix in ["open ", "launch ", "start "] {
-        if let Some(app) = text.strip_prefix(prefix).map(str::trim).filter(|v| !v.is_empty()) {
+        if let Some(app) = text
+            .strip_prefix(prefix)
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+        {
             if !app.contains(' ') || app.split_whitespace().count() <= 4 {
                 return Some(Route::OpenApp(app.to_string()));
             }
@@ -89,7 +119,10 @@ mod tests {
     #[test]
     fn routes_obvious_commands_without_guessing() {
         assert_eq!(route("Set the volume to 40%"), Some(Route::SetVolume(40)));
-        assert_eq!(route("open VS Code"), Some(Route::OpenApp("vs code".into())));
+        assert_eq!(
+            route("open VS Code"),
+            Some(Route::OpenApp("vs code".into()))
+        );
         assert_eq!(route("system status"), Some(Route::SystemInfo));
         assert_eq!(route("stop the music"), Some(Route::StopPlayback));
         assert_eq!(route("make Karen more sarcastic"), None);
@@ -125,6 +158,9 @@ mod tests {
         let replies: std::collections::HashSet<_> = (0..GREETINGS.len() * 2)
             .map(|_| fast_reply("hi").unwrap())
             .collect();
-        assert!(replies.len() > 1, "expected more than one distinct greeting to show up");
+        assert!(
+            replies.len() > 1,
+            "expected more than one distinct greeting to show up"
+        );
     }
 }

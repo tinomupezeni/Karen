@@ -44,7 +44,10 @@ pub fn is_enabled() -> bool {
 /// is running right now instead of waiting for it to exit on its own.
 pub fn set_enabled(enabled: bool) {
     unsafe {
-        std::env::set_var("FRIDAY_GESTURE_ENABLED", if enabled { "true" } else { "false" });
+        std::env::set_var(
+            "FRIDAY_GESTURE_ENABLED",
+            if enabled { "true" } else { "false" },
+        );
     }
     if !enabled {
         stop();
@@ -168,6 +171,18 @@ fn handle_event_line(app: &AppHandle, line: &str) {
     };
     let result = run_action(action);
     log::info!("[gesture] {hand} {gesture} -> {action}: {result}");
+    {
+        use tauri::Manager;
+        let memory = app.state::<crate::memory::MemoryEngine>();
+        let db = tauri::async_runtime::block_on(memory.db.lock());
+        let description =
+            format!("Gesture: {gesture} | Hand: {hand} | Action: {action} | Result: {result}");
+        if let Err(error) =
+            db.record_event("gesture_action", &description, Some("gesture::sidecar"))
+        {
+            log::warn!("[gesture] could not record action: {error}");
+        }
+    }
     let _ = app.emit(
         "karen-pipeline",
         serde_json::json!({ "stage": "running-tool", "detail": format!("Gesture: {gesture} → {result}") }),
@@ -267,7 +282,10 @@ mod tests {
 
     #[test]
     fn ignores_non_gesture_lines() {
-        assert_eq!(parse_gesture_event(r#"{"type": "status", "status": "started"}"#), None);
+        assert_eq!(
+            parse_gesture_event(r#"{"type": "status", "status": "started"}"#),
+            None
+        );
         assert_eq!(parse_gesture_event("not json"), None);
         assert_eq!(parse_gesture_event(r#"{"type": "gesture"}"#), None);
     }

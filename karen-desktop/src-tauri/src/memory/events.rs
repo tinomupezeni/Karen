@@ -1,7 +1,7 @@
 use crate::memory::Database;
 use rusqlite::Result;
-use uuid::Uuid;
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EventRecord {
@@ -13,7 +13,12 @@ pub struct EventRecord {
 }
 
 impl Database {
-    pub fn record_event(&self, event_type: &str, description: &str, source: Option<&str>) -> Result<String> {
+    pub fn record_event(
+        &self,
+        event_type: &str,
+        description: &str,
+        source: Option<&str>,
+    ) -> Result<String> {
         let id = Uuid::new_v4().to_string();
         self.conn.execute(
             "INSERT INTO events (id, event_type, description, source) VALUES (?1, ?2, ?3, ?4)",
@@ -27,9 +32,9 @@ impl Database {
             "SELECT id, event_type, description, source, recorded_at 
              FROM events 
              ORDER BY recorded_at DESC 
-             LIMIT ?1"
+             LIMIT ?1",
         )?;
-        
+
         let evt_iter = stmt.query_map([limit as i64], |row| {
             Ok(EventRecord {
                 id: row.get(0)?,
@@ -44,7 +49,7 @@ impl Database {
         for e in evt_iter {
             events.push(e?);
         }
-        
+
         // Reverse so they are chronological if we want to inject them in order
         events.reverse();
         Ok(events)

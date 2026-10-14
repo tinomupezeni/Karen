@@ -6,9 +6,16 @@ pub async fn save_memory(args: Value, app: &tauri::AppHandle) -> Value {
         return json!({ "ok": false, "error": "missing content parameter" });
     };
     let memory = app.state::<crate::memory::MemoryEngine>();
-    let embedding = if std::env::var("KAREN_LLM_PROVIDER").map(|v| v.eq_ignore_ascii_case("ollama")).unwrap_or(false) {
-        crate::memory::semantic::ollama_embedding(content).await.ok()
-    } else { None };
+    let embedding = if std::env::var("KAREN_LLM_PROVIDER")
+        .map(|v| v.eq_ignore_ascii_case("ollama"))
+        .unwrap_or(false)
+    {
+        crate::memory::semantic::ollama_embedding(content)
+            .await
+            .ok()
+    } else {
+        None
+    };
     let db = memory.db.lock().await;
     match db.save_memory_with_embedding(content, None, embedding.as_deref()) {
         Ok(id) => json!({ "ok": true, "id": id }),

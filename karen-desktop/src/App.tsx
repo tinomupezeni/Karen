@@ -8,6 +8,9 @@ type OrbState = "working" | "searching" | "solving" | "listening" | "connecting"
 type PipelineStage = "model-missing" | "transcribing" | "thinking" | "running-tool" | "confirmation-required" | "speaking" | "answer" | "error" | "idle" | "wake-followup" | "listening" | "latency";
 type PipelineEvent = { stage: PipelineStage; detail?: string };
 type PushToTalkEvent = { active: boolean };
+type TaskStatus = "queued" | "running" | "completed" | "failed";
+type TaskEvent = { task_id: string; status: TaskStatus; description: string; result?: string };
+type BackgroundTask = { id: string; description: string; status: TaskStatus; result?: string };
 
 function App() {
   const [orbState, setOrbState] = useState<OrbState>("listening")
@@ -25,6 +28,7 @@ function App() {
   const [lastCommand, setLastCommand] = useState("Awaiting your instruction, Tino.")
   const [lastResponse, setLastResponse] = useState("Friday is online and listening.")
   const [latencyText, setLatencyText] = useState("Awaiting first response")
+  const [backgroundTasks, setBackgroundTasks] = useState<BackgroundTask[]>([])
 
   useEffect(() => {
     void invoke('set_tts_provider', { provider: ttsProvider })
@@ -75,7 +79,14 @@ function App() {
     });
 
     const unlistenPipeline = listen<PipelineEvent>('karen-pipeline', ({ payload }) => {
-      setMissionLog((items) => [`${new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}  ${payload.detail ?? payload.stage.toUpperCase()}`, ...items].slice(0, 6))
+      // "answer" fires on every streamed token chunk (the text grows a
+      // little each time), not once at the end -- logging each delta as its
+      // own entry flooded the mission log with near-duplicate, progressively
+      // longer copies of the same response. Every other stage is a discrete,
+      // one-off transition and still gets its own line.
+      if (payload.stage !== "answer") {
+        setMissionLog((items) => [`${new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}  ${payload.detail ?? payload.stage.toUpperCase()}`, ...items].slice(0, 6))
+      }
       switch (payload.stage) {
         case "model-missing":
           setOrbState("working");
@@ -127,11 +138,20 @@ function App() {
       }
     });
 
+    const unlistenTask = listen<TaskEvent>('karen-task', ({ payload }) => {
+      setBackgroundTasks((tasks) => {
+        const next = tasks.filter((t) => t.id !== payload.task_id);
+        next.unshift({ id: payload.task_id, description: payload.description, status: payload.status, result: payload.result });
+        return next.slice(0, 5);
+      });
+    });
+
     return () => {
       unlistenWake.then(f => f());
       unlistenToggle.then(f => f());
       unlistenPushToTalk.then(f => f());
       unlistenPipeline.then(f => f());
+      unlistenTask.then(f => f());
     };
   }, []);
 
@@ -178,6 +198,29 @@ function App() {
         <div aria-label="Voice activity" style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '4px', height: '24px', marginTop: '13px', opacity: isMuted ? .3 : 1 }}>
           {Array.from({ length: 18 }, (_, index) => <span key={index} style={{ width: '3px', height: `${6 + ((index * 7) % 15)}px`, borderRadius: '3px', background: index % 3 === 0 ? '#72f4ca' : '#36d8f5', boxShadow: '0 0 8px #2ad8f577', animation: `wave ${.55 + (index % 5) * .09}s ease-in-out infinite alternate`, animationDelay: `${index * -.06}s` }} />)}
         </div>
+
+        {backgroundTasks.length > 0 && (
+          <div style={{ marginTop: '14px', borderTop: '1px solid #16404b', paddingTop: '10px' }}>
+            <div style={{ color: '#52dfff', letterSpacing: '2px', fontSize: '10px', marginBottom: '7px' }}>BACKGROUND TOOLS</div>
+            {backgroundTasks.map((task) => {
+              const badge = {
+                queued: { label: 'QUEUED', color: '#f6c85f' },
+                running: { label: 'RUNNING', color: '#36d8f5' },
+                completed: { label: 'DONE', color: '#72f4ca' },
+                failed: { label: 'FAILED', color: '#ff5577' },
+              }[task.status];
+              return (
+                <div key={task.id} style={{ display: 'flex', justifyContent: 'space-between', gap: '10px', fontSize: '11px', padding: '4px 0', color: '#b7dce2' }}>
+                  <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{task.description}</span>
+                  <span style={{ color: badge.color, letterSpacing: '1px', flexShrink: 0 }}>
+                    {task.status === 'running' && <span style={{ display: 'inline-block', marginRight: '5px', width: '6px', height: '6px', borderRadius: '50%', background: badge.color, animation: 'pulse .9s ease-in-out infinite alternate' }} />}
+                    {badge.label}
+                  </span>
+                </div>
+              );
+            })}
+          </div>
+        )}
       </section>
 
       <footer style={{ display: 'flex', justifyContent: 'center', gap: '12px', flexWrap: 'wrap', color: '#83b7c0', fontSize: '12px' }}>
@@ -241,7 +284,7 @@ function App() {
         </div>
       )}
       </footer>
-      <style>{`@keyframes spin { from { transform: rotate(0deg) } to { transform: rotate(360deg) } } @keyframes wave { from { transform: scaleY(.45); opacity:.45 } to { transform: scaleY(1.25); opacity:1 } } select,button { background:#091c28; color:#c8f7ff; border:1px solid #286477; border-radius:5px; padding:5px 8px } button { cursor:pointer }`}</style>
+      <style>{`@keyframes spin { from { transform: rotate(0deg) } to { transform: rotate(360deg) } } @keyframes wave { from { transform: scaleY(.45); opacity:.45 } to { transform: scaleY(1.25); opacity:1 } } @keyframes pulse { from { opacity: .3; transform: scale(.8) } to { opacity: 1; transform: scale(1.15) } } select,button { background:#091c28; color:#c8f7ff; border:1px solid #286477; border-radius:5px; padding:5px 8px } button { cursor:pointer }`}</style>
     </div>
   )
 }

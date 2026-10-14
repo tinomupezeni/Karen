@@ -1,4 +1,4 @@
-use chrono::{DateTime, Utc, TimeZone, Local};
+use chrono::{DateTime, Local, TimeZone, Utc};
 
 pub fn format_relative_time(timestamp: &str) -> String {
     // timestamp is like "2026-10-09 13:58:20" (UTC from sqlite)
@@ -20,7 +20,9 @@ pub fn format_relative_time(timestamp: &str) -> String {
             } else {
                 format!("{} hours ago", duration.num_hours())
             }
-        } else if duration.num_days() == 1 || (now.date_naive() - local.date_naive()).num_days() == 1 {
+        } else if duration.num_days() == 1
+            || (now.date_naive() - local.date_naive()).num_days() == 1
+        {
             format!("yesterday at {}", local.format("%H:%M"))
         } else {
             format!("{} days ago", duration.num_days())

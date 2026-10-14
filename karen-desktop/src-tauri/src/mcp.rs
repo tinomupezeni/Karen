@@ -40,10 +40,6 @@ const READ_ONLY_PLAYWRIGHT_TOOLS: &[&str] = &[
     "browser_console_messages",
     "browser_network_requests",
     "browser_tab_list",
-    "browser_navigate",
-    "browser_navigate_back",
-    "browser_navigate_forward",
-    "browser_reload",
     "browser_wait_for",
 ];
 
@@ -195,13 +191,15 @@ pub fn tool_defs() -> Vec<serde_json::Value> {
         .unwrap_or_default()
 }
 
-async fn connect_one(config: &McpServerConfig) -> Result<(Peer<RoleClient>, Vec<RmcpTool>), String> {
+async fn connect_one(
+    config: &McpServerConfig,
+) -> Result<(Peer<RoleClient>, Vec<RmcpTool>), String> {
     let mut cmd = tokio::process::Command::new(&config.command);
     cmd.args(&config.args);
     cmd.stdin(std::process::Stdio::null());
     cmd.stderr(std::process::Stdio::null());
-    let transport =
-        TokioChildProcess::new(cmd).map_err(|e| format!("MCP '{}': spawn failed: {e}", config.name))?;
+    let transport = TokioChildProcess::new(cmd)
+        .map_err(|e| format!("MCP '{}': spawn failed: {e}", config.name))?;
     let running = tokio::time::timeout(Duration::from_secs(30), ().serve(transport))
         .await
         .map_err(|_| format!("MCP '{}': handshake timed out", config.name))?
@@ -222,8 +220,16 @@ pub async fn ensure_started() {
         }
         match connect_one(&config).await {
             Ok((peer, tools)) => {
-                let kept: Vec<CachedTool> = tools.iter().filter_map(|t| translate_tool(&config.name, t)).collect();
-                log::info!("[mcp] '{}': {} tools ({} advertised)", config.name, tools.len(), kept.len());
+                let kept: Vec<CachedTool> = tools
+                    .iter()
+                    .filter_map(|t| translate_tool(&config.name, t))
+                    .collect();
+                log::info!(
+                    "[mcp] '{}': {} tools ({} advertised)",
+                    config.name,
+                    tools.len(),
+                    kept.len()
+                );
                 peers().lock().unwrap().insert(config.name.clone(), peer);
                 if let Ok(mut cache) = tool_cache().write() {
                     cache.retain(|t| t.server != config.name);
@@ -239,7 +245,11 @@ fn truncate_result(text: String) -> String {
     if text.len() <= MAX_RESULT_CHARS {
         return text;
     }
-    format!("{}...[truncated, {} chars total]", &text[..MAX_RESULT_CHARS], text.len())
+    format!(
+        "{}...[truncated, {} chars total]",
+        &text[..MAX_RESULT_CHARS],
+        text.len()
+    )
 }
 
 /// Call an MCP tool by qualified name. Returns a Friday-style result value.
@@ -297,6 +307,8 @@ pub async fn call_tool(qualified: &str, args: serde_json::Value) -> serde_json::
         "ok": !is_error,
         "server": server,
         "tool": tool,
+        "provenance": format!("mcp://{server}/{tool}"),
+        "untrusted_content": true,
         "result": truncate_result(texts.join("\n")),
     })
 }
@@ -353,7 +365,7 @@ mod tests {
     #[test]
     fn read_only_policy() {
         assert!(is_read_only_action("playwright", "browser_snapshot"));
-        assert!(is_read_only_action("playwright", "browser_navigate"));
+        assert!(!is_read_only_action("playwright", "browser_navigate"));
         assert!(!is_read_only_action("playwright", "browser_click"));
         assert!(!is_read_only_action("playwright", "browser_evaluate"));
         assert!(!is_read_only_action("other", "browser_snapshot"));

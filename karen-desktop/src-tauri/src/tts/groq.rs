@@ -1,4 +1,4 @@
-use super::provider::{TtsProvider, TtsError};
+use super::provider::{TtsError, TtsProvider};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -16,10 +16,10 @@ impl GroqProvider {
             .timeout(std::time::Duration::from_secs(30))
             .build()
             .map_err(|e| format!("failed to build HTTP client: {e}"))?;
-            
+
         Ok(Self { client })
     }
-    
+
     fn unique_temp_wav_path() -> std::path::PathBuf {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -52,7 +52,8 @@ impl TtsProvider for GroqProvider {
                 "response_format": "wav",
             });
 
-            let response = self.client
+            let response = self
+                .client
                 .post(TTS_URL)
                 .bearer_auth(key)
                 .json(&body)
@@ -61,6 +62,7 @@ impl TtsProvider for GroqProvider {
                 .map_err(|e| TtsError::Retryable(format!("TTS request failed: {e}")))?;
 
             let status = response.status();
+            crate::groq_keys::record_rate_limit_response(key, status.as_u16(), response.headers());
             if status.is_success() {
                 let audio = response
                     .bytes()
@@ -68,9 +70,9 @@ impl TtsProvider for GroqProvider {
                     .map_err(|e| TtsError::Retryable(format!("failed to read TTS audio: {e}")))?;
 
                 let path = Self::unique_temp_wav_path();
-                tokio::fs::write(&path, &audio)
-                    .await
-                    .map_err(|e| TtsError::Fatal(format!("failed to write TTS audio to disk: {e}")))?;
+                tokio::fs::write(&path, &audio).await.map_err(|e| {
+                    TtsError::Fatal(format!("failed to write TTS audio to disk: {e}"))
+                })?;
 
                 return Ok(path);
             }
@@ -78,14 +80,25 @@ impl TtsProvider for GroqProvider {
             let detail = response.text().await.unwrap_or_default();
             let more_keys = key_idx + 1 < keys.len();
             if more_keys && crate::groq_keys::should_try_next_key(status.as_u16()) {
-                log::warn!("[TTS] Groq key {}/{} rejected ({}), rotating to next key", key_idx + 1, keys.len(), status);
+                log::warn!(
+                    "[TTS] Groq key {}/{} rejected ({}), rotating to next key",
+                    key_idx + 1,
+                    keys.len(),
+                    status
+                );
                 last_detail = format!("{status}: {detail}");
                 continue;
             }
-            if status.as_u16() == 401 || status.as_u16() == 403 || status.as_u16() == 400 || status.as_u16() == 404 {
+            if status.as_u16() == 401
+                || status.as_u16() == 403
+                || status.as_u16() == 400
+                || status.as_u16() == 404
+            {
                 return Err(TtsError::Fatal(format!("TTS returned {status}: {detail}")));
             }
-            return Err(TtsError::Retryable(format!("TTS returned {status}: {detail}")));
+            return Err(TtsError::Retryable(format!(
+                "TTS returned {status}: {detail}"
+            )));
         }
 
         // Every key was rejected as expired or rate-limited. Report it as

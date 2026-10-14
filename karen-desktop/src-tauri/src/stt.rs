@@ -3,7 +3,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::Mutex as AsyncMutex;
-use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters, WhisperState};
+use whisper_rs::{
+    FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters, WhisperState,
+};
 
 pub struct WhisperHandle(pub AsyncMutex<Option<Arc<WhisperContext>>>);
 
@@ -107,7 +109,8 @@ async fn download_with_retries(url: &str, part_path: &std::path::Path) -> Result
         // A server that ignores Range and resends the whole file (200, not
         // 206) means our partial data doesn't line up with a fresh body --
         // start that attempt over rather than silently corrupting the file.
-        let resuming = existing_len > 0 && response.status() == reqwest::StatusCode::PARTIAL_CONTENT;
+        let resuming =
+            existing_len > 0 && response.status() == reqwest::StatusCode::PARTIAL_CONTENT;
         if existing_len > 0 && !resuming {
             let _ = tokio::fs::remove_file(part_path).await;
         }
@@ -173,7 +176,10 @@ async fn ensure_model_downloaded(app: &AppHandle) -> Result<PathBuf, String> {
     }
 
     if is_local_model_override() {
-        return Err(format!("configured Whisper model does not exist: {}", path.display()));
+        return Err(format!(
+            "configured Whisper model does not exist: {}",
+            path.display()
+        ));
     }
 
     let dir = path.parent().ok_or("invalid model path")?;
@@ -269,7 +275,13 @@ pub async fn transcribe(ctx: Arc<WhisperContext>, mono_16k: Vec<f32>) -> Result<
         state
             .full(params, &mono_16k)
             .map_err(|e| format!("whisper inference failed: {e}"))?;
-        log::info!("whisper inference ({n_threads} threads) took {:?}", inference_started.elapsed());
+        let inference_elapsed = inference_started.elapsed();
+        log::info!(
+            "STT_BENCHMARK model={} audio_secs={duration_secs:.3} audio_ctx={audio_ctx} threads={n_threads} inference_ms={} realtime_factor={:.3}",
+            model_filename(),
+            inference_elapsed.as_millis(),
+            inference_elapsed.as_secs_f32() / duration_secs.max(0.001)
+        );
 
         let n_segments = state.full_n_segments();
 

@@ -64,6 +64,7 @@ Karen/
                 ├── memories.rs        # Notes, FTS, semantic recall
                 ├── semantic.rs        # Embedding and vector ranking
                 ├── events.rs          # Activity and tool event records
+                ├── artifacts.rs       # Tool-produced file records
                 └── temporal.rs        # Relative time formatting
 ```
 
@@ -242,6 +243,15 @@ Without an override, the model is downloaded to the application data directory. 
 ```env
 KAREN_WHISPER_MODEL_PATH=/absolute/path/to/model.bin
 ```
+
+Each transcription emits a structured `STT_BENCHMARK` log line containing the
+selected model, captured audio duration, Whisper audio context, thread count,
+inference duration, and realtime factor. This makes comparisons reproducible:
+run the same utterance set with different `KAREN_WHISPER_MODEL` values and
+compare inference milliseconds and realtime factor alongside transcript
+quality. VAD behavior should be compared separately using captured duration,
+speech start/end logs, missed-voice replies, and false-trigger counts; a
+faster model is not an improvement if endpointing clips commands.
 
 ### Transcript cleanup
 
@@ -429,6 +439,21 @@ Read-only operations and safe URL opening can run automatically. Desktop mutatio
 
 Risk is added to tool definitions as `x-risk`.
 
+The registry also exposes an `x-capability` contract for every tool. It records
+the capability source (`native` or `mcp`), lifecycle (`stateless`,
+`process_scoped`, or `external_service`), input contract, output contract, and
+failure contract. The dispatcher reads the same metadata as the model-facing
+registry, so unknown capabilities are rejected instead of silently falling
+through to execution.
+
+Capability boundaries are currently grouped by execution contract:
+
+- Native read capabilities return explicit JSON success or failure.
+- Native mutations require confirmation before desktop state changes.
+- Memory and task capabilities are process-scoped because they persist through
+  SQLite.
+- MCP capabilities are external services and use namespaced tool names.
+
 ### Confirmation flow
 
 ```mermaid
@@ -460,6 +485,15 @@ Tool executions are recorded in SQLite `events` with:
 - Truncated result preview
 
 Confirmation requests are recorded as `tool_confirmation_requested`.
+
+MCP results include a `mcp://server/tool` provenance value and are marked as
+untrusted content before returning to the agent. Browser navigation and other
+state-changing Playwright actions require confirmation; snapshots, screenshots,
+console/network inspection, tab listing, and bounded waits remain read-only.
+
+Gesture input follows the same boundary. The MediaPipe sidecar emits debounced
+semantic events in dry-run mode, while Karen maps only an allowlisted set of
+safe media/volume actions and records each resulting `gesture_action` event.
 
 ## 11. Text-to-speech
 
@@ -499,6 +533,21 @@ KAREN_TTS_PROVIDER=auto
 
 TTS cancellation is generation-based and synchronous at the control boundary, which prevents a new request from racing with old speech.
 
+### Groq quota policy
+
+Groq response headers are recorded per credential for token-budget ordering,
+but 429 responses also activate a process-wide cooldown. Groq quotas are
+organization-scoped, so trying every configured key after a shared limit is
+reached only creates more rejected requests. The cooldown uses `retry-after`,
+request-reset, or token-reset headers, with a bounded 60-second fallback.
+
+For ordinary interactive LLM turns, an active Groq cooldown automatically
+selects Ollama for the turn. Explicitly forced providers are not rewritten,
+so background jobs and diagnostics retain their requested provider semantics.
+TTS already defaults to local Piper and falls back immediately when Groq is
+rate limited. This policy is intentionally local and in-process; it does not
+pretend that multiple keys in one Groq organization provide independent quota.
+
 ## 12. Memory architecture
 
 Karen uses bundled SQLite through `rusqlite`.
@@ -512,6 +561,7 @@ memories
 memories_fts
 tasks
 events
+artifacts
 ```
 
 ### Conversations
@@ -569,6 +619,14 @@ ollama pull nomic-embed-text
 ### Activity events
 
 Tool executions and recent activity are stored in `events` and included in brain context.
+
+### Artifacts
+
+Tool-produced files are recorded separately in `artifacts`, with a kind, path,
+optional source event, metadata, and timestamp. Successful screenshot results
+are registered automatically by the dispatcher. Artifact records are not
+conversation messages or memories and should not enter prompts without an
+explicit retrieval policy.
 
 ## 13. Desktop context
 
@@ -846,4 +904,3 @@ The flow is:
 17. Microphone capture resumes.
 
 This is the current foundation for Karen as a conversational and voice-operated desktop assistant.
-
